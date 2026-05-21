@@ -1,7 +1,7 @@
 # Atlas — Master Context Document
 
 Last updated: 2026-05-21  
-Current phase: **10 complete**  
+Current phase: **11 complete**  
 Repo: `https://github.com/syedhamzahabib2026-source/Atlas`  
 Primary project target: `C:\Users\shamz\Desktop\Assignmint`
 
@@ -138,6 +138,14 @@ After every task, `LessonExtractor.maybe_promote()` evaluates two promotion rule
 Before every task, `ContextBuilder.build_for_task()` queries global lessons filtered by topic keywords inferred from the task title/description, and attaches up to 3 to `OperationalContext.global_lessons`. These render as a `## Cross-project intelligence` section (≤3 lines) at the bottom of the injected prompt block — after project-specific context so they don't crowd it.
 
 Promoted lessons also surface in the Slack insight list returned by `MemorySummarizer.extract_from_task()`.
+
+### Phase 11 — Lesson Quality Feedback Loop
+`memory/operational_memory.py`, `memory/context_builder.py`, `memory/memory_summarizer.py`, `memory/lesson_extractor.py`  
+Closes the loop on Phase 10: lessons that correlate with task success get boosted, lessons that don't get demoted and eventually retired. No new tables — `signal_score` and `access_count` already existed in `operational_memories`.
+
+`ContextBuilder.build_for_task()` now calls `get_global_lessons()` with `return_ids=True` (single query, no second round-trip) and writes the returned IDs into `task.metadata["injected_lesson_ids"]`. At teardown, `MemorySummarizer.extract_from_task()` reads those IDs and calls `update_lesson_signal(lesson_id, succeeded)` for each one — nudging `signal_score` ±5, clamped 0–100, and incrementing `access_count`.
+
+`LessonExtractor.retire_weak_lessons()` deletes any global lesson with `signal_score < 25` AND `access_count >= 5` — it's been applied repeatedly and never helped. Called non-fatally at the end of every `maybe_promote()` so cleanup is automatic and never blocks task teardown.
 
 ---
 
