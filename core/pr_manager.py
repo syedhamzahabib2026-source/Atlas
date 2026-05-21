@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from core.logger import get_logger
@@ -69,6 +71,14 @@ class MergeResult:
     success: bool
     merged: bool = False
     message: str = ""
+    error: str | None = None
+
+
+@dataclass
+class PushResult:
+    """Returned by push_branch()."""
+
+    success: bool
     error: str | None = None
 
 
@@ -148,6 +158,36 @@ class PRManager:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    async def push_branch(self, branch_name: str, repo_path: Path | str) -> PushResult:
+        """
+        Push branch_name to origin from repo_path via subprocess git.
+
+        Runs git push origin <branch_name> synchronously in a thread,
+        matching the asyncio.to_thread pattern used by git_manager.py.
+        """
+        def _push() -> None:
+            result = subprocess.run(
+                ["git", "push", "origin", branch_name],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "git push failed")
+
+        try:
+            await self._run(_push)
+            logger.info("Pushed branch %s to origin", branch_name)
+            return PushResult(success=True)
+        except subprocess.TimeoutExpired:
+            msg = f"git push timed out for branch {branch_name}"
+            logger.error(msg)
+            return PushResult(success=False, error=msg)
+        except Exception as exc:
+            logger.error("push_branch failed for %s: %s", branch_name, exc)
+            return PushResult(success=False, error=str(exc))
 
     async def create_pr(
         self,

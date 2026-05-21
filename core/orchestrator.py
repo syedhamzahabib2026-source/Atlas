@@ -584,7 +584,27 @@ class Orchestrator:
                 await self.slack.notify_task_completed(task, result)
 
     async def _open_pr_and_request_approval(self, task, branch: str) -> None:
-        """Create a GitHub PR and move task to AWAITING_APPROVAL."""
+        """Push branch, create a GitHub PR, and move task to AWAITING_APPROVAL."""
+        repo_path = task.metadata.get("git", {}).get("repo_path")
+        if repo_path:
+            push_result = await self.pr_manager.push_branch(branch, repo_path)
+            if not push_result.success:
+                logger.error(
+                    "Branch push failed for task %s: %s", task.id[:8], push_result.error
+                )
+                if self.slack and self.config.slack_ready:
+                    await self.slack.notify(
+                        f"⚠️ Task `{task.id[:8]}` succeeded but branch push failed: "
+                        f"{push_result.error}\nBranch `{branch}` may need manual push."
+                    )
+                self.tasks.update_status(task.id, TaskStatus.COMPLETED)
+                await self.tasks.persist(task)
+                return
+        else:
+            logger.warning(
+                "No repo_path in task %s git metadata — skipping push", task.id[:8]
+            )
+
         title = task.title[:72]
         body = (
             f"Automated PR opened by Atlas.\n\n"
