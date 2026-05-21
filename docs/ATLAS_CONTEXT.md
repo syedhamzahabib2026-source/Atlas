@@ -381,3 +381,105 @@ SQLite at `memory/atlas.db`. Five tables in `operational_memories` schema plus d
 9. **PowerShell here-strings for multi-line git commits.** Bash `<<'EOF'` heredocs don't work in PowerShell. Always use `@'...'@`.
 
 10. **One Atlas process at a time.** Kill all existing `python main.py` processes before starting a new one. Multiple instances will fight over the same SQLite DB and tmux sessions.
+
+---
+
+## PHASE 10 — CROSS-PROJECT INTELLIGENCE
+
+### What We Realized
+
+Atlas learned from every task it ran — but only within a single project.
+Lessons learned on AssignMint never helped the next project.
+Every new project started from zero intelligence.
+
+Atlas needed:
+- a global memory layer that persists across all projects
+- automatic lesson extraction after every task completes
+- cross-project pattern injection into future task prompts
+
+---
+
+### WHAT WE BUILT
+
+We implemented: **cross-project engineering intelligence**
+
+---
+
+### SYSTEMS CREATED
+
+**`upsert_global_lesson()` / `get_global_lessons()` (`operational_memory.py`)**
+- Writes and retrieves lessons stored under `project_id = "__global__"`
+- Uses the existing `operational_memories` table — zero new tables needed
+- SHA256-keyed upserts prevent duplicate lessons
+- Tag-based filtering with fallback to all global lessons
+- `signal_score` tracks lesson quality (0–100)
+
+**`global_lessons` field (`memory_models.py`)**
+- Added `global_lessons: list[str]` to `OperationalContext` dataclass
+- Renders as `## Cross-project intelligence` section (≤3 items)
+- Appears at the bottom of every task's context prompt block
+
+**Context injection (`context_builder.py`)**
+- `build_for_task()` now calls `get_global_lessons()` after per-project context
+- `_infer_topics()` maps task title/description keywords to relevant tags
+- Global lessons are injected into EVERY task prompt regardless of project
+
+**`LessonExtractor` (`memory/lesson_extractor.py` — new file)**
+- `maybe_promote()` runs at the end of every task teardown
+- Rule 1: strategy succeeded after ≥2 prior failures → promoted to global
+- Rule 2: failure pattern seen ≥3 times in a project → global warning
+- Promoted lessons are appended to Slack insight notifications
+
+**Wired into `MemorySummarizer` (`memory_summarizer.py`)**
+- `LessonExtractor` instantiated in `__init__`
+- `maybe_promote()` called at end of `extract_from_task()`
+- Zero impact on task lifecycle — failures are non-fatal
+
+---
+
+### IMPORTANT BREAKTHROUGH
+
+**Atlas now learns across projects.**
+
+A recovery strategy that worked on AssignMint
+automatically gets injected into the next project's task prompts.
+A failure pattern seen 3 times on one repo
+becomes a global warning for all future tasks.
+
+---
+
+### KEY LESSON
+
+Cross-project intelligence requires:
+- no new tables — reuse existing patterns (`__global__` sentinel)
+- non-fatal extraction — never let learning break task teardown
+- structured promotion rules — not everything deserves to be global
+
+---
+
+### RESULT OF PHASE 10
+
+Atlas became: **a self-improving engineering system**
+
+Every task makes Atlas smarter for every future task on every future project.
+
+---
+
+### CURRENT STATUS OF ATLAS
+
+Atlas now includes:
+- persistent orchestration
+- autonomous terminal execution
+- browser verification
+- adaptive recovery
+- rollback safety
+- operational memory
+- runtime persistence
+- Slack control infrastructure
+- multi-project scheduling
+- autonomous PR lifecycle
+- human approval workflows
+- cross-project routing
+- global cross-project intelligence
+- lesson extraction and promotion
+- self-improving task context
