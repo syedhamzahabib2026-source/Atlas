@@ -117,6 +117,11 @@ class ClaudeCodeAgent(BaseAgent):
             parts.append(task.title)
             if task.description:
                 parts.append(task.description)
+        parts.append(
+            "\n\nIMPORTANT: After completing all changes, you MUST run:\n"
+            "git add -A && git commit -m 'atlas: <describe what you did>'\n"
+            "Do not finish without committing."
+        )
         return "\n\n".join(parts)
 
     async def start_session(self, task: Task) -> str:

@@ -38,10 +38,12 @@ class GitSafetyCoordinator:
         self.health = health or HealthTracker(config.health_regression_threshold)
 
     def resolve_project_path(self, projects_dir: Path, task: Task) -> Path:
-        if task.metadata.get("project_path"):
-            return Path(task.metadata["project_path"]).resolve()
-        if task.metadata.get("working_dir"):
-            return Path(task.metadata["working_dir"]).resolve()
+        for key in ("working_dir", "project_path"):
+            val = task.metadata.get(key)
+            if val:
+                p = Path(val).resolve()
+                if p.exists():
+                    return p
         if task.project_id:
             return (projects_dir / task.project_id).resolve()
         return projects_dir.resolve()
@@ -58,8 +60,15 @@ class GitSafetyCoordinator:
             return False
 
         project_path = self.resolve_project_path(projects_dir, task)
+        logger.info(
+            "prepare_workspace: task=%s working_dir=%r → project_path=%s",
+            task.id[:8],
+            task.metadata.get("working_dir"),
+            project_path,
+        )
         project_path.mkdir(parents=True, exist_ok=True)
         repo_path = await self.git.find_repo(project_path)
+        logger.info("prepare_workspace: find_repo → %s", repo_path)
         if not repo_path:
             logger.debug("No git repo for task %s at %s", task.id[:8], project_path)
             return False
