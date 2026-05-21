@@ -40,6 +40,8 @@ class GitSafetyCoordinator:
     def resolve_project_path(self, projects_dir: Path, task: Task) -> Path:
         if task.metadata.get("project_path"):
             return Path(task.metadata["project_path"]).resolve()
+        if task.metadata.get("working_dir"):
+            return Path(task.metadata["working_dir"]).resolve()
         if task.project_id:
             return (projects_dir / task.project_id).resolve()
         return projects_dir.resolve()
