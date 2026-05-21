@@ -491,3 +491,41 @@ Atlas now includes:
 - global cross-project intelligence
 - lesson extraction and promotion
 - self-improving task context
+- proactive task suggestions
+- autonomous issue detection
+
+---
+
+## PHASE 12 — PROACTIVE TASK SUGGESTIONS
+
+### What We Realized
+
+Atlas waited for humans to notice problems and assign tasks.
+But Atlas already had all the data to notice problems itself —
+risk zones, failure patterns, global warnings.
+Atlas needed to surface work before being asked.
+
+---
+
+### WHAT WE BUILT
+
+**`core/task_scanner.py` (new)** — scans three signals per project:
+- High-risk zones (`risk_zones` table, score ≥ 60) → 🔴 HIGH if score ≥ 75, 🟡 MEDIUM otherwise
+- Recurring failure patterns (`failure_patterns` table, count ≥ 3) → 🟡 MEDIUM
+- Global failure warnings (`__global__` lessons tagged `"failure"`) → 🟡 MEDIUM
+
+Returns up to 5 prioritised `Suggestion` objects with ready-to-run `/atlas start` prompts. `format_suggestions()` renders the Slack message block.
+
+**Background loop (`orchestrator.py`)** — `asyncio.create_task()` started before `run_loop()`. Waits the full interval before first scan (no Slack spam on restart). Fires every 6 hours (`configs/default.yaml: scanner.interval_hours`). Posts to configured Slack channel automatically. Wrapped in `try/except` — never affects task execution.
+
+**`/atlas scan [project]` (`atlas_controller.py`)** — on-demand version. Scans all projects or one specific project and returns results immediately as the slash command reply. Shares `orchestrator.run_scanner(project_filter)` with the background loop — no logic duplication.
+
+**Config** (`default.yaml` + `AtlasConfig`) — `scanner.enabled` and `scanner.interval_hours` with `ATLAS_SCANNER_ENABLED` / `ATLAS_SCANNER_INTERVAL_HOURS` env overrides.
+
+---
+
+### RESULT OF PHASE 12
+
+Atlas became: **a system that notices things for you.**
+
+Shift from tool you command → system that works for you.
