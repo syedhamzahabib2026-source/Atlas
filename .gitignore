@@ -15,3 +15,4 @@ logs/screenshots/
 *.db
 .idea/
 .vscode/
+.DS_Store
