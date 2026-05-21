@@ -73,6 +73,7 @@ class AtlasController:
             return self._help_text()
 
         if sub == "start":
+            logger.info("START args: %s", parsed.args)
             args = list(parsed.args)
             project_name: str | None = None
             if "--project" in args:

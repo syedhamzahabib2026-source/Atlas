@@ -20,6 +20,8 @@ def parse_atlas_command(text: str) -> ParsedCommand:
     Parse '/atlas start fix bug' or 'start fix bug' (slash command text body).
     """
     raw = (text or "").strip()
+    # Normalize Slack's smart-dash substitutions (em-dash → --, en-dash → -)
+    raw = raw.replace("—", "--").replace("–", "-")
     parts = raw.split()
     if not parts:
         return ParsedCommand(subcommand="help", args=[], raw=raw)
