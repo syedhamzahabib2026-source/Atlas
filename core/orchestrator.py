@@ -605,6 +605,27 @@ class Orchestrator:
                 "No repo_path in task %s git metadata — skipping push", task.id[:8]
             )
 
+        if repo_path:
+            diff_check = await asyncio.to_thread(
+                __import__("subprocess").run,
+                ["git", "log", "origin/main..HEAD", "--oneline"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if not diff_check.stdout.strip():
+                msg = (
+                    f"✅ Task `{task.id[:8]}` complete — no code changes to merge, "
+                    f"branch is identical to main."
+                )
+                logger.info("Task %s has no new commits vs origin/main — skipping PR", task.id[:8])
+                self.tasks.update_status(task.id, TaskStatus.COMPLETED)
+                await self.tasks.persist(task)
+                if self.slack and self.config.slack_ready:
+                    await self.slack.notify(msg)
+                return
+
         title = task.title[:72]
         body = (
             f"Automated PR opened by Atlas.\n\n"
