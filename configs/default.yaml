@@ -75,6 +75,10 @@ projects:
     repo_path: "C:/Users/shamz/Desktop/Assignmint"
     description: "AssignMint web app"
 
+scanner:
+  interval_hours: 6             # background scan frequency (0 = disable background loop)
+  enabled: true                 # set false to disable proactive Slack suggestions entirely
+
 # Slack tokens/IDs belong in .env — only non-secret Slack settings here.
 slack:
   enabled: false                    # overridden by ATLAS_SLACK_ENABLED=true in .env

@@ -117,6 +117,8 @@ class AtlasConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    scanner_interval_hours: float = 6.0
+    scanner_enabled: bool = True
     _yaml: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -165,6 +167,7 @@ def load_config(
     recovery_cfg = yaml_data.get("recovery", {})
     git_cfg = yaml_data.get("git", {})
     runtime_cfg = yaml_data.get("runtime", {})
+    scanner_cfg = yaml_data.get("scanner", {})
     projects_cfg = yaml_data.get("projects", {})
 
     projects = {
@@ -354,5 +357,11 @@ def load_config(
             ),
         ),
         projects=projects,
+        scanner_interval_hours=float(
+            _env("ATLAS_SCANNER_INTERVAL_HOURS", str(scanner_cfg.get("interval_hours", 6.0)))
+        ),
+        scanner_enabled=_env_bool(
+            "ATLAS_SCANNER_ENABLED", scanner_cfg.get("enabled", True)
+        ),
         _yaml=yaml_data,
     )

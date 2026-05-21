@@ -92,6 +92,8 @@ class Orchestrator:
         logger.info("Atlas orchestrator starting (Phase 8)")
         await self._bootstrap()
         self._running = True
+        if self.config.scanner_enabled and self.memory_coordinator:
+            asyncio.create_task(self._scanner_loop())
         await self.run_loop()
 
     async def stop(self, *, graceful: bool = True) -> None:
@@ -729,6 +731,51 @@ class Orchestrator:
         insights = await self.memory_coordinator.extract_after_task(task, result)
         if insights and self.slack and self.config.slack_ready:
             await self.slack.notify_memory_insights(task, insights)
+
+    async def _scanner_loop(self) -> None:
+        """Background proactive scan — fires every scanner_interval_hours hours."""
+        interval_sec = self.config.scanner_interval_hours * 3600
+        logger.info(
+            "Proactive scanner loop started (interval=%.1fh)", self.config.scanner_interval_hours
+        )
+        while self._running:
+            await asyncio.sleep(interval_sec)
+            if not self._running:
+                break
+            try:
+                msg = await self.run_scanner()
+                if self.slack and self.config.slack_ready:
+                    await self.slack.notify(msg)
+            except Exception:
+                logger.exception("Proactive scanner failed — skipping this cycle")
+
+    async def run_scanner(self, project_filter: str | None = None) -> str:
+        """Scan memory for actionable signals. Returns formatted Slack message.
+
+        Called by the background loop and directly by /atlas scan.
+        Non-fatal: caller is responsible for try/except on the background path.
+        """
+        from core.task_scanner import TaskScanner, format_suggestions
+
+        if not self.memory_coordinator:
+            return "Memory coordinator not active — scanner unavailable."
+
+        scanner = TaskScanner(self.memory_coordinator.store)
+        projects = dict(self.config.projects)
+
+        if project_filter:
+            if project_filter not in projects:
+                known = ", ".join(f"`{k}`" for k in projects) or "none configured"
+                return f"Unknown project `{project_filter}`. Known: {known}"
+            projects = {project_filter: projects[project_filter]}
+
+        all_suggestions = []
+        for name in projects:
+            sug = await scanner.scan_project(name, name)
+            all_suggestions.extend(sug)
+
+        all_suggestions.sort(key=lambda s: 0 if s.priority == "high" else 1)
+        return format_suggestions(all_suggestions[:5], scanned=list(projects.keys()))
 
     async def _persist_result(self, task, result: TaskResult) -> None:
         await self._persist_operational_memory(task, result)

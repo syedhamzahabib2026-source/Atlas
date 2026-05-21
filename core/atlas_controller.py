@@ -136,6 +136,10 @@ class AtlasController:
                 return "Usage: `/atlas reject <task_id> <reason>` — reason is required"
             return await self._handle_reject(tid, reason)
 
+        if sub == "scan":
+            project_filter = parsed.args[0] if parsed.args else None
+            return await self._handle_scan(project_filter)
+
         return f"Unknown subcommand `{sub}`. Try `/atlas help`."
 
     def _help_text(self) -> str:
@@ -145,11 +149,18 @@ class AtlasController:
             "• `/atlas stop [task_id] [--kill]` — cancel running task\n"
             "• `/atlas approve <task_id>` — merge PR and mark task complete\n"
             "• `/atlas reject <task_id> <reason>` — send task back for rework\n"
+            "• `/atlas scan [project]` — proactive memory scan; suggest tasks to run\n"
             "• `/atlas status` — tasks overview\n"
             "• `/atlas sessions` — tmux sessions + tasks\n"
             "• `/atlas logs [task_id]` — recent Atlas log tail\n"
             "\n_Reply in a blocked task thread to unblock Atlas._"
         )
+
+    async def _handle_scan(self, project_filter: str | None = None) -> str:
+        """Run an on-demand memory scan and return formatted suggestions."""
+        if not self.orchestrator.memory_coordinator:
+            return "Memory not active — enable `memory.enabled` in config."
+        return await self.orchestrator.run_scanner(project_filter)
 
     async def _handle_approve(self, task_id: str) -> str:
         if not self.approval_manager:
