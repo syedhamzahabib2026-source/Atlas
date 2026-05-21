@@ -1,0 +1,23 @@
+# Phase 6: Git safety + verification + recovery chain
+#
+# Place project in a git repo under projects/<project_id>/
+# Atlas will: isolate branch → checkpoint → execute → verify → recover safely
+
+example_task:
+  agent: claude_code
+  recovery_enabled: true
+  project_id: my-app
+  prompt: "Fix the login button handler"
+  verify:
+    workflow: verify_login
+    workflow_params:
+      url: http://localhost:3000/login
+      email: test@example.com
+      password: test
+      success_selector: ".dashboard"
+
+# task.metadata.git after run (illustrative):
+#   branch: atlas/task-abc123def
+#   checkpoints: [{ commit_hash, strategy, attempt, timestamp }]
+#   rollback_history: [{ to_hash, reason, method }]
+#   health_history: [{ score, regression_detected, ... }]

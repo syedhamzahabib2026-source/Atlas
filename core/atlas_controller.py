@@ -1,0 +1,407 @@
+"""
+Atlas control API — used by Slack (and future remote interfaces).
+
+Bridges inbound commands to task manager, tmux, and orchestrator lifecycle.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from core.blocked import block_reason_label, detect_block
+from core.logger import get_logger
+from core.task_manager import Task, TaskStatus
+from core.task_result import ResultStatus, TaskResult
+if TYPE_CHECKING:
+    from core.approval_manager import ApprovalManager
+    from core.orchestrator import Orchestrator
+    from core.pr_manager import PRManager
+
+logger = get_logger("controller")
+
+
+class AtlasController:
+    """Remote control surface for Atlas."""
+
+    def __init__(
+        self,
+        orchestrator: Orchestrator,
+        approval_manager: ApprovalManager | None = None,
+        pr_manager: PRManager | None = None,
+    ) -> None:
+        self.orchestrator = orchestrator
+        self.tasks = orchestrator.tasks
+        self.tmux = orchestrator.tmux
+        self.config = orchestrator.config
+        self.slack = orchestrator.slack
+        self.approval_manager = approval_manager
+        self.pr_manager = pr_manager
+
+    def _resolve_task_id(self, token: str | None) -> Task | None:
+        if not token:
+            running = self.tasks.list_by_status(TaskStatus.RUNNING)
+            if len(running) == 1:
+                return running[0]
+            return None
+        task = self.tasks.get(token)
+        if task:
+            return task
+        token = token.lower()
+        for t in self.tasks.list_all():
+            if t.id.lower().startswith(token):
+                return t
+        return None
+
+    async def handle_command(
+        self,
+        text: str,
+        *,
+        user_id: str,
+        channel_id: str,
+        thread_ts: str | None = None,
+    ) -> str:
+        """Execute a parsed /atlas command and return Slack-visible text."""
+        from slack.commands import parse_atlas_command
+
+        parsed = parse_atlas_command(text)
+        sub = parsed.subcommand
+
+        if sub == "help":
+            return self._help_text()
+
+        if sub == "start":
+            prompt = " ".join(parsed.args).strip()
+            if not prompt:
+                return "Usage: `/atlas start <prompt>`"
+            task = await self.start_task(
+                prompt,
+                slack_user_id=user_id,
+                slack_channel_id=channel_id,
+                slack_thread_ts=thread_ts,
+            )
+            return (
+                f"Task queued\n"
+                f"• id: `{task.id}`\n"
+                f"• status: `{task.status.value}`\n"
+                f"• project: `{task.project_id}`"
+            )
+
+        if sub == "stop":
+            kill = "--kill" in parsed.args
+            tid = next((a for a in parsed.args if not a.startswith("--")), None)
+            return await self.stop_task(tid, kill_session=kill)
+
+        if sub == "status":
+            return self.format_status()
+
+        if sub == "sessions":
+            return await self.format_sessions()
+
+        if sub == "logs":
+            tid = parsed.args[0] if parsed.args else None
+            return self.format_logs(tid)
+
+        if sub == "approve":
+            tid = parsed.args[0] if parsed.args else None
+            if not tid:
+                return "Usage: `/atlas approve <task_id>`"
+            return await self._handle_approve(tid)
+
+        if sub == "reject":
+            if not parsed.args:
+                return "Usage: `/atlas reject <task_id> <reason>`"
+            tid = parsed.args[0]
+            reason = " ".join(parsed.args[1:]).strip()
+            if not reason:
+                return "Usage: `/atlas reject <task_id> <reason>` — reason is required"
+            return await self._handle_reject(tid, reason)
+
+        return f"Unknown subcommand `{sub}`. Try `/atlas help`."
+
+    def _help_text(self) -> str:
+        return (
+            "*Atlas commands*\n"
+            "• `/atlas start <prompt>` — queue a Claude Code task\n"
+            "• `/atlas stop [task_id] [--kill]` — cancel running task\n"
+            "• `/atlas approve <task_id>` — merge PR and mark task complete\n"
+            "• `/atlas reject <task_id> <reason>` — send task back for rework\n"
+            "• `/atlas status` — tasks overview\n"
+            "• `/atlas sessions` — tmux sessions + tasks\n"
+            "• `/atlas logs [task_id]` — recent Atlas log tail\n"
+            "\n_Reply in a blocked task thread to unblock Atlas._"
+        )
+
+    async def _handle_approve(self, task_id: str) -> str:
+        if not self.approval_manager:
+            return "Approval manager not configured."
+        if not self.pr_manager:
+            return "PR manager not configured (GITHUB_TOKEN missing?)."
+
+        req = self.approval_manager.get_approval(task_id)
+        if not req:
+            return f"No pending approval found for `{task_id}`. Use `/atlas status` to check."
+
+        task = self._resolve_task_id(req.task_id)
+
+        merge = await self.pr_manager.merge_pr(req.pr_number)
+        if not merge.success:
+            msg = f"PR merge failed for `{req.task_id[:8]}`: {merge.error}"
+            if self.slack:
+                await self.slack.notify(msg)
+            return msg
+
+        if task:
+            self.tasks.update_status(task.id, TaskStatus.MERGED)
+
+        self.approval_manager.clear_approval(req.task_id)
+
+        msg = f"✅ PR #`{req.pr_number}` merged — task `{req.task_id[:8]}` complete."
+        if self.slack:
+            await self.slack.notify(msg)
+        logger.info("Task %s approved and merged (PR #%s)", req.task_id[:8], req.pr_number)
+        return msg
+
+    async def _handle_reject(self, task_id: str, reason: str) -> str:
+        if not self.approval_manager:
+            return "Approval manager not configured."
+
+        req = self.approval_manager.get_approval(task_id)
+        if not req:
+            return f"No pending approval found for `{task_id}`. Use `/atlas status` to check."
+
+        task = self._resolve_task_id(req.task_id)
+        if not task:
+            return f"Task `{req.task_id[:8]}` not found in task manager."
+
+        self.approval_manager.clear_approval(req.task_id)
+
+        base_prompt = task.metadata.get("prompt") or task.description
+        task.metadata["prompt"] = (
+            f"{base_prompt}\n\n"
+            f"Previous PR was rejected. Rejection reason:\n{reason}\n"
+            f"Please address this feedback and try again."
+        )
+        task.metadata["rejection_reason"] = reason
+        task.metadata["failure_count"] = 0
+        self.tasks.update_status(task.id, TaskStatus.PENDING, error=None)
+
+        msg = f"↩️ Task `{req.task_id[:8]}` sent back for rework: {reason}"
+        if self.slack:
+            await self.slack.notify(msg)
+        logger.info("Task %s rejected: %s", req.task_id[:8], reason)
+        return msg
+
+    async def start_task(
+        self,
+        prompt: str,
+        *,
+        project_id: str | None = None,
+        slack_user_id: str | None = None,
+        slack_channel_id: str | None = None,
+        slack_thread_ts: str | None = None,
+    ) -> Task:
+        """Create a pending task for the orchestrator loop."""
+        pid = project_id or f"slack-{slack_user_id or 'remote'}"
+        title = prompt[:80] + ("..." if len(prompt) > 80 else "")
+        task = self.tasks.create(
+            title=title,
+            description=prompt,
+            project_id=pid,
+            metadata={
+                "agent": "claude_code",
+                "prompt": prompt,
+                "source": "slack",
+                "slack_user_id": slack_user_id,
+                "slack_channel_id": slack_channel_id,
+                "slack_thread_ts": slack_thread_ts,
+            },
+        )
+        logger.info("Task created via Slack: %s", task.id[:8])
+        return task
+
+    async def stop_task(
+        self,
+        task_id: str | None = None,
+        *,
+        kill_session: bool = False,
+    ) -> str:
+        """Gracefully stop a running task."""
+        task = self._resolve_task_id(task_id)
+        if not task:
+            return "No matching task. Use `/atlas status` or `/atlas stop <task_id>`."
+
+        if task.status not in (TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.BLOCKED):
+            return f"Task `{task.id[:8]}` is already `{task.status.value}`."
+
+        self.orchestrator.request_cancel(task.id)
+        session = task.session_name
+
+        if kill_session and session and self.tmux:
+            await self.tmux.kill_session(session)
+            logger.info("Killed tmux session %s for stop", session)
+
+        if task.status == TaskStatus.PENDING:
+            self.tasks.update_status(task.id, TaskStatus.CANCELLED)
+        else:
+            self.tasks.update_status(task.id, TaskStatus.CANCELLED, error="stopped via Slack")
+
+        if self.slack:
+            await self.slack.notify_task_stopped(task)
+
+        return (
+            f"Stop requested for `{task.id[:8]}`\n"
+            f"• session: `{session or 'n/a'}`\n"
+            f"• kill_session: `{kill_session}`"
+        )
+
+    def format_status(self) -> str:
+        lines = ["*Atlas status*"]
+        by_status: dict[str, list[Task]] = {}
+        for task in sorted(self.tasks.list_all(), key=lambda t: t.created_at, reverse=True):
+            by_status.setdefault(task.status.value, []).append(task)
+
+        if not by_status:
+            return "No tasks yet. Use `/atlas start <prompt>`."
+
+        from slack.commands import format_duration
+
+        for status, tasks in by_status.items():
+            lines.append(f"\n*{status}* ({len(tasks)})")
+            for t in tasks[:8]:
+                sid = t.session_name or "n/a"
+                dur = format_duration(t.started_at)
+                lines.append(
+                    f"• `{t.id[:8]}` | {t.title[:40]} | session `{sid}` | running {dur}"
+                )
+        return "\n".join(lines)
+
+    async def format_sessions(self) -> str:
+        lines = ["*Atlas sessions*"]
+        if not self.tmux or not self.tmux.is_available():
+            lines.append("_tmux unavailable on this host._")
+        else:
+            names = await self.tmux.list_sessions()
+            if not names:
+                lines.append("_No active tmux sessions._")
+            for name in names:
+                lines.append(f"• tmux: `{name}`")
+
+        lines.append("\n*Task ↔ session map*")
+        active = [
+            t
+            for t in self.tasks.list_all()
+            if t.status in (TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.BLOCKED)
+        ]
+        if not active:
+            lines.append("_No active tasks._")
+        else:
+            from slack.commands import format_duration
+
+            for t in active:
+                lines.append(
+                    f"• `{t.id[:8]}` | `{t.status.value}` | "
+                    f"session `{t.session_name or 'pending'}` | "
+                    f"{format_duration(t.started_at)}"
+                )
+        return "\n".join(lines)
+
+    def format_logs(self, task_id: str | None = None) -> str:
+        log_path = self.config.log_dir / "atlas.log"
+        if not log_path.exists():
+            return "No log file yet."
+
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = lines[-self.config.slack.log_tail_lines :]
+
+        header = "*Atlas logs* (tail)"
+        if task_id:
+            task = self._resolve_task_id(task_id)
+            if task:
+                short = task.id[:8]
+                filtered = [ln for ln in tail if short in ln]
+                if filtered:
+                    tail = filtered[-20:]
+                    header = f"*Logs for task `{short}`*"
+                result = task.metadata.get("result", {})
+                if result.get("raw_output"):
+                    preview = result["raw_output"][-600:]
+                    return f"{header}\n```\n{preview}\n```"
+
+        body = "\n".join(tail[-20:])
+        if len(body) > 2800:
+            body = body[-2800:]
+        return f"{header}\n```\n{body}\n```"
+
+    async def handle_thread_reply(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: str,
+        text: str,
+        user_id: str,
+    ) -> bool:
+        """
+        If this thread is a blocked task, apply human response and re-queue.
+
+        Returns True if handled.
+        """
+        task = self.tasks.find_blocked_by_thread(channel_id, thread_ts)
+        if not task:
+            return False
+
+        await self.unblock_task(task, text.strip(), user_id=user_id)
+        return True
+
+    async def unblock_task(
+        self,
+        task: Task,
+        response: str,
+        *,
+        user_id: str | None = None,
+    ) -> None:
+        """Resume a BLOCKED task with human input."""
+        if not response:
+            return
+
+        task.metadata["human_response"] = response
+        task.metadata["unblocked_by"] = user_id
+        task.metadata["unblocked_at"] = datetime.now(timezone.utc).isoformat()
+        task.metadata.pop("blocked_question", None)
+        base = task.metadata.get("prompt") or task.description
+        task.metadata["prompt"] = f"{base}\n\nHuman clarification:\n{response}"
+        task.metadata["failure_count"] = 0
+        self.tasks.update_status(task.id, TaskStatus.PENDING, error=None)
+        logger.info("Task %s unblocked via Slack", task.id[:8])
+
+        if self.slack:
+            await self.slack.notify(
+                f"Task `{task.id[:8]}` unblocked. Resuming with your reply.",
+                thread_ts=task.metadata.get("slack_thread_ts"),
+            )
+
+    async def enter_blocked(
+        self,
+        task: Task,
+        reason: str,
+        question: str,
+    ) -> None:
+        """Mark task BLOCKED and ask via Slack."""
+        self.tasks.update_status(task.id, TaskStatus.BLOCKED, error=reason)
+        task.metadata["blocked_reason"] = reason
+        task.metadata["blocked_question"] = question
+
+        if not task.metadata.get("slack_channel_id"):
+            task.metadata["slack_channel_id"] = self.config.slack.channel_id
+
+        if self.slack:
+            parent_ts = await self.slack.ask_question(
+                task,
+                f"*Atlas blocked* ({block_reason_label(reason)})\n{question}",
+            )
+            if parent_ts:
+                task.metadata["slack_thread_ts"] = parent_ts
+
+        logger.info("Task %s blocked: %s", task.id[:8], reason)

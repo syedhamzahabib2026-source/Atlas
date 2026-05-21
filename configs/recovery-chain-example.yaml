@@ -1,0 +1,22 @@
+# Example: code change + browser verification + adaptive recovery
+#
+# Queue via TaskManager.create(metadata={...}) or extend Slack /atlas start
+
+recovery_chain_task:
+  agent: claude_code
+  recovery_enabled: true
+  prompt: "Fix the login button so users can sign in."
+  verify:
+    workflow: verify_login
+    workflow_params:
+      url: https://your-app.com/login
+      email: test@example.com
+      password: testpass
+      success_selector: ".dashboard"
+  # On verify failure, RecoveryEngine will:
+  # 1. Classify failure (frontend/auth/network/...)
+  # 2. Detect contradictions if same symptom repeats
+  # 3. Enter INVESTIGATING after 2+ failures
+  # 4. Select a NEW strategy (not repeat minimal_patch)
+  # 5. Build root-cause-oriented retry prompt
+  # 6. Escalate to BLOCKED + Slack if limits exceeded

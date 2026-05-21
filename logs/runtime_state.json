@@ -1,0 +1,30 @@
+{
+  "atlas_pid": 29556,
+  "started_at": "2026-05-21T03:22:49.403934+00:00",
+  "last_shutdown_at": null,
+  "last_shutdown_graceful": false,
+  "orchestrator_running": true,
+  "active_task_ids": [],
+  "project_queues": {},
+  "tmux_sessions_mapped": {},
+  "recovery_chains_active": [],
+  "resource_usage": {
+    "total_active": 0,
+    "claude_active": 0,
+    "browser_active": 0,
+    "max_total": 3,
+    "max_claude": 2,
+    "max_browser": 2
+  },
+  "integrity_issues": [],
+  "boot_count": 4,
+  "metadata": {
+    "recovery_report": {
+      "tasks_restored": 3,
+      "tasks_normalized": 0,
+      "sessions_reconnected": 0,
+      "sessions_orphaned": 0
+    },
+    "saved_at": "2026-05-21T03:29:45.905501+00:00"
+  }
+}

@@ -1,0 +1,75 @@
+﻿# Atlas configuration — all values here are overridable by environment variables.
+# Secrets (tokens, API keys) must live in .env only, never here.
+
+orchestrator:
+  poll_interval_sec: 5
+  max_concurrent_tasks: 3          # raise to 5+ on a beefy machine
+
+logging:
+  level: INFO                       # DEBUG for verbose agent output
+
+sessions:
+  session_prefix: atlas
+  tmux_socket: ~                    # null = default socket; set path to share socket
+
+claude_code:
+  command: claude
+  max_execution_sec: 3600           # 1 h hard cap per task
+  poll_interval_sec: 2              # how often Atlas checks tmux pane output
+  launch_wait_sec: 20               # wait after spawning claude before polling (bumped from 15)
+  idle_stable_polls: 3              # consecutive idle reads before marking done
+  capture_lines: 200                # pane lines captured per poll
+  kill_session_on_finish: false     # keep session alive for post-mortem inspection
+
+browser:
+  headless: true
+  timeout_ms: 30000                 # per-action Playwright timeout
+  max_runtime_sec: 120              # hard cap for an entire browser task
+  screenshots_dir: logs/screenshots
+  capture_success_screenshot: true
+  capture_failure_screenshot: true
+  viewport_width: 1280
+  viewport_height: 720
+
+recovery:
+  max_recovery_attempts: 5          # total retries before giving up
+  max_same_strategy_failures: 2     # switch strategy after this many same-strategy fails
+  investigate_after_failures: 2     # trigger root-cause analysis after N failures
+  escalate_after_attempts: 6        # ask human via Slack after this many total attempts
+
+git:
+  enabled: true
+  branch_prefix: atlas/task
+  protected_branches:
+    - main
+    - master
+  block_work_on_protected: true     # force Atlas onto a task branch, never touch main
+  auto_checkpoint_before_retry: true
+  auto_isolate_branch: true
+  max_consecutive_rollbacks: 3
+  max_dependency_modifications: 5   # flag if Claude touches package files this many times
+  health_regression_threshold: 15   # score-point drop that counts as regression
+  progressive_worsening_attempts: 3 # consecutive worsening snapshots -> escalate
+
+memory:
+  enabled: true
+  db_path: memory/atlas.db
+  prune_max_age_days: 90
+  inject_context_into_prompts: true
+
+runtime:
+  enabled: true
+  state_path: logs/runtime_state.json
+  stale_task_hours: 72              # tasks stuck longer than this are force-cancelled
+  max_runaway_retries: 10           # hard stop for a task retrying in a tight loop (was 15)
+  max_browser_concurrent: 2
+  max_claude_concurrent: 2
+  per_project_max_concurrent: 2
+  snapshot_interval_ticks: 12       # persist runtime state every N orchestrator ticks
+  orphan_session_cleanup: true      # kill tmux sessions with no matching task on boot
+
+# Slack tokens/IDs belong in .env — only non-secret Slack settings here.
+slack:
+  enabled: false                    # overridden by ATLAS_SLACK_ENABLED=true in .env
+  log_tail_lines: 40
+  stop_kill_session_default: false

@@ -1,0 +1,25 @@
+# Phase 7: Operational memory on tasks
+#
+# Set project_id so memory accumulates per project.
+# Atlas injects context before run and extracts after completion.
+
+example_task:
+  agent: claude_code
+  project_id: assignmint
+  title: Fix notification badge after login
+  prompt: "Fix the notification badge count when user logs in"
+  metadata:
+    architecture_note: "Auth uses JWT middleware; notifications depend on session store"
+  verify:
+    workflow: verify_notification_badge
+    workflow_params:
+      url: http://localhost:3000/app
+      badge_selector: ".notification-badge"
+      expected_text: "1"
+
+# Stored automatically (distilled, not raw logs):
+# - strategy_stats (success rates per strategy/category)
+# - risk_zones (auth, notification, middleware paths)
+# - failure_patterns (recurring error signatures)
+# - operational_memories (success/failure summaries)
+# - task_outcomes (lightweight history)

@@ -1,0 +1,52 @@
+# Example browser task payloads (queue via Slack or TaskManager.create metadata).
+# Usage: copy a block into task.metadata when creating a browser task.
+
+examples:
+  verify_login:
+    agent: browser
+    workflow: verify_login
+    url: https://example.com/login
+    workflow_params:
+      url: https://example.com/login
+      email: user@example.com
+      password: secret
+      email_selector: "#email"
+      password_selector: "#password"
+      submit_selector: 'button[type="submit"]'
+      success_selector: ".dashboard"
+
+  verify_button:
+    agent: browser
+    workflow: verify_button
+    workflow_params:
+      url: https://example.com
+      button_selector: "#submit-btn"
+      result_selector: ".success-message"
+
+  verify_notification_badge:
+    agent: browser
+    workflow: verify_notification_badge
+    workflow_params:
+      url: https://example.com/app
+      badge_selector: ".notification-badge"
+      expected_text: "3"
+
+  verify_mobile_layout:
+    agent: browser
+    mobile: true
+    workflow: verify_mobile_layout
+    workflow_params:
+      url: https://example.com
+      main_selector: main
+      nav_selector: nav
+
+  custom_steps:
+    agent: browser
+    url: https://example.com
+    steps:
+      - action: goto
+        url: https://example.com
+      - action: assert_visible
+        selector: "h1"
+      - action: screenshot
+        label: homepage
