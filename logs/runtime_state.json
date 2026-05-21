@@ -1,6 +1,6 @@
 {
-  "atlas_pid": 3784,
-  "started_at": "2026-05-21T03:38:04.508982+00:00",
+  "atlas_pid": 7908,
+  "started_at": "2026-05-21T03:51:10.482679+00:00",
   "last_shutdown_at": null,
   "last_shutdown_graceful": false,
   "orchestrator_running": true,
@@ -19,14 +19,14 @@
   "integrity_issues": [
     "Previous shutdown was not graceful"
   ],
-  "boot_count": 5,
+  "boot_count": 6,
   "metadata": {
     "recovery_report": {
-      "tasks_restored": 4,
+      "tasks_restored": 5,
       "tasks_normalized": 0,
       "sessions_reconnected": 0,
       "sessions_orphaned": 0
     },
-    "saved_at": "2026-05-21T03:50:05.441392+00:00"
+    "saved_at": "2026-05-21T03:52:05.911662+00:00"
   }
 }
