@@ -1,7 +1,7 @@
 # Atlas — Master Context Document
 
 Last updated: 2026-05-21  
-Current phase: **9 complete, Phase 10 in design**  
+Current phase: **10 complete**  
 Repo: `https://github.com/syedhamzahabib2026-source/Atlas`  
 Primary project target: `C:\Users\shamz\Desktop\Assignmint`
 
@@ -128,6 +128,16 @@ Full Slack Socket Mode integration. Commands: `/atlas start`, `/atlas stop`, `/a
 ### Phase 9 — GitHub PR Lifecycle
 `core/pr_manager.py`, `core/approval_manager.py`  
 After a task succeeds and git isolation is active: push branch to origin → create GitHub PR → set task AWAITING_APPROVAL → post Slack message with approve/reject instructions. `/atlas approve <id>` → merge PR via API → MERGED. `/atlas reject <id> <reason>` → append reason to prompt → reset to PENDING for rework.
+
+### Phase 10 — Cross-Project Intelligence
+`memory/lesson_extractor.py`, `memory/operational_memory.py`, `memory/memory_models.py`, `memory/context_builder.py`, `memory/memory_summarizer.py`  
+Global memory layer built on top of the existing `operational_memories` table using `project_id = "__global__"` sentinel (same pattern as `strategy_stats`). No new tables or dependencies.
+
+After every task, `LessonExtractor.maybe_promote()` evaluates two promotion rules: (1) a recovery strategy that succeeded after ≥2 prior failures on the same category is promoted as a global lesson; (2) a failure pattern seen ≥3 times in a project is promoted as a global warning. Lessons are SHA256-keyed so the same insight is idempotent across upserts.
+
+Before every task, `ContextBuilder.build_for_task()` queries global lessons filtered by topic keywords inferred from the task title/description, and attaches up to 3 to `OperationalContext.global_lessons`. These render as a `## Cross-project intelligence` section (≤3 lines) at the bottom of the injected prompt block — after project-specific context so they don't crowd it.
+
+Promoted lessons also surface in the Slack insight list returned by `MemorySummarizer.extract_from_task()`.
 
 ---
 
@@ -308,11 +318,11 @@ SQLite at `memory/atlas.db`. Five tables in `operational_memories` schema plus d
 4. `ClaudeCodeAgent._build_prompt()` prepends `operational_context` as the first section of every prompt
 
 ### Memory keying
-**Strictly per `project_id`.** Tasks without `--project` use `project_id = "slack-<user_id>"` or `"default"`. Memory learned from Assignmint tasks does NOT flow to other projects. Cross-project learning is **Phase 10**.
+**Per `project_id` for all project-specific data.** Tasks without `--project` use `project_id = "slack-<user_id>"` or `"default"`. Global lessons use `project_id = "__global__"` (same sentinel already used by `strategy_stats`). Cross-project learning is live as of **Phase 10**.
 
 ---
 
-## Phase 10 — Cross-Project Intelligence (Planned)
+## Phase 10 — Cross-Project Intelligence (Complete)
 
 **Goal:** After every task completes, extract *reusable* lessons into a global layer. Future tasks on any project benefit from what Atlas learned on previous projects.
 
