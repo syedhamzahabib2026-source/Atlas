@@ -73,21 +73,37 @@ class AtlasController:
             return self._help_text()
 
         if sub == "start":
-            prompt = " ".join(parsed.args).strip()
+            args = list(parsed.args)
+            project_name: str | None = None
+            if "--project" in args:
+                idx = args.index("--project")
+                if idx + 1 < len(args):
+                    project_name = args[idx + 1]
+                    args = args[:idx] + args[idx + 2:]
+                else:
+                    return "Usage: `/atlas start --project <name> <prompt>`"
+
+            prompt = " ".join(args).strip()
             if not prompt:
-                return "Usage: `/atlas start <prompt>`"
+                return "Usage: `/atlas start [--project <name>] <prompt>`"
+
             task = await self.start_task(
                 prompt,
+                project_name=project_name,
                 slack_user_id=user_id,
                 slack_channel_id=channel_id,
                 slack_thread_ts=thread_ts,
             )
-            return (
+            reply = (
                 f"Task queued\n"
                 f"• id: `{task.id}`\n"
                 f"• status: `{task.status.value}`\n"
                 f"• project: `{task.project_id}`"
             )
+            if project_name:
+                wd = task.metadata.get("working_dir", "not found in config")
+                reply += f"\n• working_dir: `{wd}`"
+            return reply
 
         if sub == "stop":
             kill = "--kill" in parsed.args
@@ -124,7 +140,7 @@ class AtlasController:
     def _help_text(self) -> str:
         return (
             "*Atlas commands*\n"
-            "• `/atlas start <prompt>` — queue a Claude Code task\n"
+            "• `/atlas start [--project <name>] <prompt>` — queue a Claude Code task\n"
             "• `/atlas stop [task_id] [--kill]` — cancel running task\n"
             "• `/atlas approve <task_id>` — merge PR and mark task complete\n"
             "• `/atlas reject <task_id> <reason>` — send task back for rework\n"
@@ -199,27 +215,46 @@ class AtlasController:
         prompt: str,
         *,
         project_id: str | None = None,
+        project_name: str | None = None,
         slack_user_id: str | None = None,
         slack_channel_id: str | None = None,
         slack_thread_ts: str | None = None,
     ) -> Task:
         """Create a pending task for the orchestrator loop."""
-        pid = project_id or f"slack-{slack_user_id or 'remote'}"
+        pid = project_id or project_name or f"slack-{slack_user_id or 'remote'}"
         title = prompt[:80] + ("..." if len(prompt) > 80 else "")
+
+        metadata: dict = {
+            "agent": "claude_code",
+            "prompt": prompt,
+            "source": "slack",
+            "slack_user_id": slack_user_id,
+            "slack_channel_id": slack_channel_id,
+            "slack_thread_ts": slack_thread_ts,
+        }
+
+        if project_name:
+            proj_cfg = self.config.projects.get(project_name)
+            if proj_cfg:
+                metadata["working_dir"] = proj_cfg.repo_path
+                logger.info(
+                    "Task %s → project %r at %s",
+                    pid, project_name, proj_cfg.repo_path,
+                )
+            else:
+                logger.warning(
+                    "Project %r not found in config — known: %s",
+                    project_name,
+                    list(self.config.projects),
+                )
+
         task = self.tasks.create(
             title=title,
             description=prompt,
             project_id=pid,
-            metadata={
-                "agent": "claude_code",
-                "prompt": prompt,
-                "source": "slack",
-                "slack_user_id": slack_user_id,
-                "slack_channel_id": slack_channel_id,
-                "slack_thread_ts": slack_thread_ts,
-            },
+            metadata=metadata,
         )
-        logger.info("Task created via Slack: %s", task.id[:8])
+        logger.info("Task created via Slack: %s (project=%s)", task.id[:8], pid)
         return task
 
     async def stop_task(

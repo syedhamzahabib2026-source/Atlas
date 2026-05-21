@@ -65,6 +65,14 @@ class ClaudeCodeConfig:
     kill_session_on_finish: bool = False
 
 
+@dataclass
+class ProjectConfig:
+    """A known project repo that Atlas can target via --project <name>."""
+
+    repo_path: str
+    description: str = ""
+
+
 def _env_list(key: str, default: list[str] | None = None) -> list[str]:
     raw = os.environ.get(key)
     if not raw:
@@ -108,6 +116,7 @@ class AtlasConfig:
     memory_config: MemoryConfig = field(default_factory=MemoryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
+    projects: dict[str, ProjectConfig] = field(default_factory=dict)
     _yaml: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -156,6 +165,16 @@ def load_config(
     recovery_cfg = yaml_data.get("recovery", {})
     git_cfg = yaml_data.get("git", {})
     runtime_cfg = yaml_data.get("runtime", {})
+    projects_cfg = yaml_data.get("projects", {})
+
+    projects = {
+        name: ProjectConfig(
+            repo_path=p.get("repo_path", ""),
+            description=p.get("description", ""),
+        )
+        for name, p in (projects_cfg or {}).items()
+        if isinstance(p, dict) and p.get("repo_path")
+    }
 
     slack_enabled = _env_bool("ATLAS_SLACK_ENABLED", slack_cfg.get("enabled", False))
 
@@ -334,5 +353,6 @@ def load_config(
                 slack_cfg.get("stop_kill_session_default", False),
             ),
         ),
+        projects=projects,
         _yaml=yaml_data,
     )
