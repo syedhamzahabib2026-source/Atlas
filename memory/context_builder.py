@@ -16,18 +16,28 @@ class ContextBuilder:
     """Prepare task context from operational memory."""
 
     def __init__(self, store: OperationalMemoryStore) -> None:
+        self.store = store
         self.queries = MemoryQueries(store)
 
     async def build_for_task(self, task, project_name: str | None = None) -> OperationalContext:
         name = project_name or task.project_id or "default"
         ctx = await self.queries.build_context(task, name)
+        topics = self._infer_topics(task)
+        ctx.global_lessons = await self.store.get_global_lessons(topics, limit=3)
         logger.info(
-            "Built operational context for %s: %d history, %d cautions",
+            "Built operational context for %s: %d history, %d cautions, %d global",
             task.id[:8],
             len(ctx.relevant_history),
             len(ctx.cautions),
+            len(ctx.global_lessons),
         )
         return ctx
+
+    def _infer_topics(self, task) -> list[str]:
+        combined = f"{task.title} {task.description or ''}".lower()
+        keywords = ["auth", "migration", "test", "api", "deploy", "fix",
+                    "refactor", "database", "ci", "permissions"]
+        return [k for k in keywords if k in combined]
 
     def apply_to_task(self, task, ctx: OperationalContext) -> None:
         """Inject context into task metadata for agents (not buried in agents)."""

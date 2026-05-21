@@ -271,6 +271,45 @@ class OperationalMemoryStore:
             for row in cur.fetchall()
         ]
 
+    async def upsert_global_lesson(
+        self,
+        content: str,
+        category: str,
+        signal_score: float = 0.8,
+        tags: list[str] | None = None,
+    ) -> None:
+        """Write a cross-project lesson into operational_memories under __global__."""
+        import hashlib
+        lesson_id = "global_" + hashlib.sha256(content.encode()).hexdigest()[:12]
+        await self.upsert_memory(
+            OperationalMemoryRecord(
+                id=lesson_id,
+                project_id="__global__",
+                category=category,
+                subcategory="lesson",
+                title=content[:80],
+                summary=content,
+                tags=tags or [],
+                signal_score=int(signal_score * 100),
+            )
+        )
+
+    async def get_global_lessons(
+        self,
+        topics: list[str] | None = None,
+        limit: int = 5,
+    ) -> list[str]:
+        """Fetch cross-project lessons, optionally filtered by tag overlap."""
+        rows = await self.list_memories("__global__", limit=50)
+        if topics:
+            def overlaps(row: dict) -> bool:
+                row_tags = row.get("tags") or []
+                return any(t in row_tags for t in topics)
+            filtered = [r for r in rows if overlaps(r)]
+            rows = filtered or rows
+        rows.sort(key=lambda r: r.get("signal_score", 0), reverse=True)
+        return [r["summary"] for r in rows[:limit]]
+
     async def bump_risk_zone(
         self,
         project_id: str,

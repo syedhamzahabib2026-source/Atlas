@@ -18,6 +18,7 @@ from memory.memory_models import (
     TaskMemory,
     new_id,
 )
+from memory.lesson_extractor import LessonExtractor
 from memory.operational_memory import OperationalMemoryStore
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class MemorySummarizer:
 
     def __init__(self, store: OperationalMemoryStore) -> None:
         self.store = store
+        self.lesson_extractor = LessonExtractor(self.store)
 
     def _project_id(self, task) -> str:
         return task.project_id or "default"
@@ -98,6 +100,9 @@ class MemorySummarizer:
 
         # TODO: semantic diff — compare checkpoints for file-level insights
         # TODO: AI-generated architecture observations
+
+        promoted = await self.lesson_extractor.maybe_promote(task, result, pid)
+        insights.extend(promoted)
 
         return insights
 

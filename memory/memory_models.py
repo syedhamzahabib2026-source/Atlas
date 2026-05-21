@@ -173,6 +173,7 @@ class OperationalContext:
     cautions: list[str] = field(default_factory=list)
     suggested_strategies: list[str] = field(default_factory=list)
     high_risk_areas: list[str] = field(default_factory=list)
+    global_lessons: list[str] = field(default_factory=list)
 
     def to_prompt_block(self) -> str:
         lines = [
@@ -194,5 +195,8 @@ class OperationalContext:
         if self.suggested_strategies:
             lines.extend(["", "## Strategies that worked before"])
             lines.extend(f"- {s}" for s in self.suggested_strategies[:4])
+        if self.global_lessons:
+            lines.extend(["", "## Cross-project intelligence"])
+            lines.extend(f"- {lesson}" for lesson in self.global_lessons[:3])
         lines.append("")
         return "\n".join(lines)
