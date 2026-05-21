@@ -76,12 +76,15 @@ class ClaudeCodeAgent(BaseAgent):
         tmux: TmuxManager,
         projects_dir: Path,
         config: ClaudeCodeConfig | None = None,
+        pool_tmux: dict[str, TmuxManager] | None = None,
     ) -> None:
         self.tmux = tmux
+        self.pool_tmux = pool_tmux or {}
         self.projects_dir = projects_dir
         self.config = config or ClaudeCodeConfig()
         self._session_name: str | None = None
         self._last_output: str = ""
+        self._active_tmux: TmuxManager | None = None
 
     def can_handle(self, task: Task) -> bool:
         agent = task.metadata.get("agent")
@@ -89,12 +92,33 @@ class ClaudeCodeAgent(BaseAgent):
             return False
         return agent is None or agent == self.name
 
+    def _tmux_for(self, task: Task) -> TmuxManager:
+        pool_id = task.metadata.get("worker_pool")
+        if pool_id and pool_id in self.pool_tmux:
+            return self.pool_tmux[pool_id]
+        prefix = task.metadata.get("session_prefix")
+        if prefix:
+            return TmuxManager(session_prefix=str(prefix), socket_path=self.tmux.socket_path)
+        return self.tmux
+
     def _resolve_session_name(self, task: Task) -> str:
         custom = task.metadata.get("session_name")
         if custom:
             return str(custom)
         key = task.project_id or task.id[:12]
-        return self.tmux.session_name(key)
+        return self._tmux_for(task).session_name(key)
+
+    def _launch_command(self, task: Task) -> str:
+        """Pool-isolated Claude launch — subscription vs API key env."""
+        import os
+
+        base = self.config.command
+        auth_mode = task.metadata.get("pool_auth_mode", "subscription")
+        if auth_mode == "api_key":
+            key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+            if key:
+                return f"ANTHROPIC_API_KEY={key} {base}"
+        return base
 
     def _resolve_working_dir(self, task: Task) -> Path:
         if path := task.metadata.get("working_dir"):
@@ -126,7 +150,9 @@ class ClaudeCodeAgent(BaseAgent):
 
     async def start_session(self, task: Task) -> str:
         """Create or reuse tmux session and launch Claude Code."""
-        if not self.tmux.is_available():
+        tmux = self._tmux_for(task)
+        self._active_tmux = tmux
+        if not tmux.is_available():
             raise RuntimeError("tmux unavailable — cannot start Claude Code session")
 
         if not shutil.which(self.config.command) and self.tmux.backend.value != "wsl":
@@ -147,21 +173,22 @@ class ClaudeCodeAgent(BaseAgent):
             task.id[:8],
         )
 
-        created = await self.tmux.create_session(
+        created = await tmux.create_session(
             self._session_name,
             working_dir=working_dir,
         )
         if not created:
             raise RuntimeError(f"Failed to create tmux session: {self._session_name}")
 
+        launch_cmd = self._launch_command(task)
         # Launch Claude Code if pane does not already show it
-        snapshot = await self.tmux.capture_output(
+        snapshot = await tmux.capture_output(
             self._session_name,
             lines=30,
         )
         if self.config.command.lower() not in snapshot.lower():
-            logger.info("Launching %s in %s", self.config.command, self._session_name)
-            ok = await self.tmux.send_keys(self._session_name, self.config.command)
+            logger.info("Launching %s in %s", launch_cmd, self._session_name)
+            ok = await tmux.send_keys(self._session_name, launch_cmd)
             if not ok:
                 raise RuntimeError(f"Failed to launch {self.config.command}")
             await asyncio.sleep(self.config.launch_wait_sec)
@@ -182,7 +209,8 @@ class ClaudeCodeAgent(BaseAgent):
             len(text),
         )
 
-        ok = await self.tmux.send_keys(self._session_name, text)
+        tmux = self._active_tmux or self.tmux
+        ok = await tmux.send_keys(self._session_name, text)
         if not ok:
             raise RuntimeError("Failed to send prompt to tmux session")
 
@@ -256,14 +284,15 @@ class ClaudeCodeAgent(BaseAgent):
                 logger.info("Execution cancelled: %s", session)
                 break
 
-            if not await self.tmux.session_exists(session):
+            tmux = self._active_tmux or self.tmux
+            if not await tmux.session_exists(session):
                 result.status = ResultStatus.FAILED
                 result.errors.append("tmux session disappeared")
                 result.summary = "Session lost during execution"
                 logger.error("Session lost: %s", session)
                 break
 
-            output = await self.tmux.capture_output(
+            output = await tmux.capture_output(
                 session,
                 lines=self.config.capture_lines,
             )
@@ -329,7 +358,8 @@ class ClaudeCodeAgent(BaseAgent):
             # TODO: retries — if result.status == TIMEOUT, re-queue with metadata
 
             if self.config.kill_session_on_finish:
-                await self.tmux.kill_session(session)
+                tmux = self._active_tmux or self.tmux
+                await tmux.kill_session(session)
 
             return result
 

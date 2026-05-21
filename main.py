@@ -91,15 +91,18 @@ def build_orchestrator(
     memory_coordinator=None,
     task_store=None,
     runtime=None,
+    worker_pools=None,
 ) -> Orchestrator:
     browser = BrowserTaskAgent(
         screenshots_dir=config.screenshots_dir,
         config=_browser_agent_config(config),
     )
+    pool_tmux = worker_pools.pool_tmux if worker_pools else None
     claude = ClaudeCodeAgent(
         tmux=tmux,
         projects_dir=config.projects_dir,
         config=_claude_agent_config(config),
+        pool_tmux=pool_tmux,
     )
     recovery = RecoveryEngine(config.recovery, log_dir=config.log_dir)
     git_safety = GitSafetyCoordinator(config.git)
@@ -115,6 +118,7 @@ def build_orchestrator(
         memory_coordinator=memory_coordinator,
         task_store=task_store,
         runtime=runtime,
+        worker_pools=worker_pools,
     )
 
 
@@ -147,6 +151,13 @@ async def run(
         session_prefix=config.tmux_session_prefix,
         socket_path=config.tmux_socket,
     )
+    from core.worker_pool_manager import WorkerPoolManager
+
+    worker_pools = (
+        WorkerPoolManager(config.worker_pools, tmux_socket=config.tmux_socket)
+        if config.worker_pools.enabled
+        else None
+    )
     slack = None
     if config.slack.enabled:
         from slack.bot import SlackBot
@@ -161,6 +172,7 @@ async def run(
         memory_coordinator=memory_coordinator,
         task_store=task_store,
         runtime=runtime,
+        worker_pools=worker_pools,
     )
 
     if dashboard:
@@ -173,7 +185,27 @@ async def run(
         from core.dashboard import print_dashboard
 
         state = runtime.state_store.load() if runtime else None
-        print_dashboard(config, task_manager, state, tmux_sessions=sessions)
+        from core.approval_policy import ApprovalPolicy
+        from core.approval_engine import ApprovalEngine
+        from core.deployment_manager import DeploymentManager
+        from core.deployment_policy import DeploymentPolicy
+
+        approval_engine = ApprovalEngine(policy=ApprovalPolicy(config.approval))
+        approval_engine.rehydrate_from_tasks(task_manager.list_all())
+        deployment_manager = DeploymentManager(
+            config=config.deployment,
+            policy=DeploymentPolicy(config.deployment),
+        )
+
+        print_dashboard(
+            config,
+            task_manager,
+            state,
+            tmux_sessions=sessions,
+            worker_pools=worker_pools,
+            approval_engine=approval_engine,
+            deployment_manager=deployment_manager,
+        )
         if task_store:
             await task_store.close()
         return

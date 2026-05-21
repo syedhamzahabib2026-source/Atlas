@@ -15,9 +15,12 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from core.approval_config import ApprovalConfig
+from core.deployment_config import DeploymentConfig
 from core.git_config import GitSafetyConfig
 from core.memory_config import MemoryConfig
 from core.recovery_config import RecoveryConfig
+from core.pool_config import WorkerPoolsConfig, pools_config_from_yaml
 from core.runtime_config import RuntimeConfig
 
 
@@ -119,6 +122,9 @@ class AtlasConfig:
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     scanner_interval_hours: float = 6.0
     scanner_enabled: bool = True
+    worker_pools: WorkerPoolsConfig = field(default_factory=WorkerPoolsConfig)
+    approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+    deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
     _yaml: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -169,6 +175,9 @@ def load_config(
     runtime_cfg = yaml_data.get("runtime", {})
     scanner_cfg = yaml_data.get("scanner", {})
     projects_cfg = yaml_data.get("projects", {})
+    worker_pools_cfg = yaml_data.get("worker_pools", {})
+    approval_cfg = yaml_data.get("approval", {})
+    deployment_cfg = yaml_data.get("deployment", {})
 
     projects = {
         name: ProjectConfig(
@@ -362,6 +371,67 @@ def load_config(
         ),
         scanner_enabled=_env_bool(
             "ATLAS_SCANNER_ENABLED", scanner_cfg.get("enabled", True)
+        ),
+        worker_pools=pools_config_from_yaml(worker_pools_cfg),
+        deployment=DeploymentConfig(
+            enabled=_env_bool("ATLAS_DEPLOYMENT_ENABLED", deployment_cfg.get("enabled", True)),
+            auto_start_after_merge=_env_bool(
+                "ATLAS_DEPLOY_AUTO_START",
+                deployment_cfg.get("auto_start_after_merge", True),
+            ),
+            mock_ci=_env_bool("ATLAS_DEPLOY_MOCK_CI", deployment_cfg.get("mock_ci", True)),
+            mock_deploy=_env_bool(
+                "ATLAS_DEPLOY_MOCK_DEPLOY", deployment_cfg.get("mock_deploy", True)
+            ),
+            staging_url_template=_env(
+                "ATLAS_STAGING_URL",
+                deployment_cfg.get("staging_url_template", "https://staging.example.com"),
+            )
+            or "https://staging.example.com",
+            production_url_template=_env(
+                "ATLAS_PRODUCTION_URL",
+                deployment_cfg.get("production_url_template", "https://app.example.com"),
+            )
+            or "https://app.example.com",
+            staging_verify_enabled=_env_bool(
+                "ATLAS_STAGING_VERIFY",
+                deployment_cfg.get("staging_verify_enabled", True),
+            ),
+            production_requires_approval=_env_bool(
+                "ATLAS_PRODUCTION_REQUIRES_APPROVAL",
+                deployment_cfg.get("production_requires_approval", True),
+            ),
+            never_auto_deploy_critical=_env_bool(
+                "ATLAS_NEVER_AUTO_DEPLOY_CRITICAL",
+                deployment_cfg.get("never_auto_deploy_critical", True),
+            ),
+        ),
+        approval=ApprovalConfig(
+            enabled=_env_bool("ATLAS_APPROVAL_ENABLED", approval_cfg.get("enabled", True)),
+            auto_approve_low_risk=_env_bool(
+                "ATLAS_AUTO_APPROVE_LOW_RISK",
+                approval_cfg.get("auto_approve_low_risk", True),
+            ),
+            require_approval_high_risk=_env_bool(
+                "ATLAS_REQUIRE_APPROVAL_HIGH_RISK",
+                approval_cfg.get("require_approval_high_risk", True),
+            ),
+            require_approval_for_dependencies=_env_bool(
+                "ATLAS_REQUIRE_APPROVAL_DEPENDENCIES",
+                approval_cfg.get("require_approval_for_dependencies", True),
+            ),
+            require_approval_for_deployments=_env_bool(
+                "ATLAS_REQUIRE_APPROVAL_DEPLOYMENTS",
+                approval_cfg.get("require_approval_for_deployments", True),
+            ),
+            escalate_on_high_rollback_count=_env_int(
+                "ATLAS_APPROVAL_ESCALATE_ROLLBACKS",
+                approval_cfg.get("escalate_on_high_rollback_count", 3),
+            ),
+            escalate_on_excessive_retries=_env_int(
+                "ATLAS_APPROVAL_ESCALATE_RETRIES",
+                approval_cfg.get("escalate_on_excessive_retries", 6),
+            ),
         ),
         _yaml=yaml_data,
     )

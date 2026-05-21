@@ -2,7 +2,7 @@
 
 Persistent autonomous AI orchestration system — not a chatbot.
 
-Atlas controls coding agents, terminal sessions, browser automation, memory, and Slack communication. **Phase 1** establishes the architecture and control-plane skeleton; AI logic, LangGraph, and Playwright come later.
+Atlas controls coding agents, terminal sessions, browser automation, memory, Slack, and **multi-pool workload routing**. Phase 13 added subscription/API worker pools with isolated tmux namespaces — see [docs/ATLAS_PHASES.md](docs/ATLAS_PHASES.md).
 
 ## Phase 1–2 scope
 
@@ -163,17 +163,34 @@ Runtime settings in `configs/default.yaml` under `runtime:`.
 
 Future extension points (not implemented): `core/future_systems.py`.
 
+## Worker pools (Phase 13)
+
+Atlas routes Claude tasks through **isolated worker pools** instead of switching auth in one session:
+
+| Pool | Session prefix | Auth |
+|------|----------------|------|
+| Subscription | `atlas-sub-*` | Claude subscription login |
+| API | `atlas-api-*` | `ANTHROPIC_API_KEY` (fallback / overflow) |
+| Local | `atlas-local-*` | Placeholder (future) |
+
+Subscription-first routing; on exhaustion, `AuthMonitor` cools down the subscription pool and overflows to API. Dashboard shows pool health and cooldowns.
+
+Config: `configs/default.yaml` → `worker_pools:`. Details: [docs/ATLAS_CONTEXT.md](docs/ATLAS_CONTEXT.md), [docs/ATLAS_PHASES.md](docs/ATLAS_PHASES.md).
+
 ## Roadmap (high level)
 
-1. **Phase 1** — Architecture skeleton (this repo state)
-2. **Phase 2** — tmux + Claude Code terminal control (current)
-3. **Phase 3** — Slack remote control (`/atlas` commands, notifications, blocked workflow)
-4. **Phase 4** — Playwright browser verification + screenshots
-5. **Phase 5** — Adaptive recovery (strategy rotation, investigation mode, escalation)
-6. **Phase 6** — Git safety: checkpoints, isolated branches, rollback, regression detection
-7. **Phase 7** — Operational memory (structured engineering intelligence)
-8. **Phase 8** — Persistent runtime, task DB, multi-project scheduling, dashboard
-9. **Future** — LangGraph, distributed workers, autonomous PRs
+1. **Phase 1** — Architecture skeleton
+2. **Phase 2** — tmux + Claude Code terminal control
+3. **Phase 3** — Slack remote control
+4. **Phase 4** — Playwright browser verification
+5. **Phase 5** — Adaptive recovery
+6. **Phase 6** — Git safety
+7. **Phase 7** — Operational memory
+8. **Phase 8** — Persistent runtime, dashboard
+9. **Phase 9–11** — PR lifecycle, cross-project intelligence, lesson feedback
+10. **Phase 12** — Proactive task scanner
+11. **Phase 13** — Worker pool orchestration (current)
+12. **Future** — Local/OpenAI/Gemini pools, distributed workers, LangGraph, cost-aware routing
 
 ## License
 

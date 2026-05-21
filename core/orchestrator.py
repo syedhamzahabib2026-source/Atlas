@@ -20,10 +20,13 @@ from core.task_result import ResultStatus, TaskResult
 
 if TYPE_CHECKING:
     from agents.base import BaseAgent
+    from core.approval_engine import ApprovalEngine
     from core.approval_manager import ApprovalManager
-    from core.pr_manager import PRManager
+    from core.deployment_manager import DeploymentManager
+    from core.pr_manager import PRManager, PRPreparationManager
     from core.runtime_manager import RuntimeManager
     from core.task_store import TaskStore
+    from core.worker_pool_manager import WorkerPoolManager
     from memory.memory_coordinator import MemoryCoordinator
     from memory.store import MemoryStore
     from sessions.tmux_manager import TmuxManager
@@ -54,11 +57,13 @@ class Orchestrator:
         memory_coordinator: MemoryCoordinator | None = None,
         runtime: RuntimeManager | None = None,
         task_store: TaskStore | None = None,
+        worker_pools: WorkerPoolManager | None = None,
     ) -> None:
         self.config = config
         self.tasks = task_manager
         self.task_store = task_store
         self.runtime = runtime
+        self.worker_pools = worker_pools
         self.memory = memory
         self.memory_coordinator = memory_coordinator
         self.tmux = tmux
@@ -72,8 +77,11 @@ class Orchestrator:
         self._running = False
         self._cancel_events: dict[str, asyncio.Event] = {}
         self.controller = None
+        self.approval_engine: ApprovalEngine | None = None
         self.approval_manager: ApprovalManager | None = None
         self.pr_manager: PRManager | None = None
+        self.pr_preparation: PRPreparationManager | None = None
+        self.deployment_manager: DeploymentManager | None = None
 
     def request_cancel(self, task_id: str) -> None:
         event = self._cancel_events.get(task_id)
@@ -126,13 +134,16 @@ class Orchestrator:
                 self.tasks, self.task_store, self.tmux, slack=self.slack
             )
 
-        from core.atlas_controller import AtlasController
+        from core.approval_engine import ApprovalEngine
         from core.approval_manager import ApprovalManager
-        from core.pr_manager import GitHubConfig, PRManager
+        from core.approval_policy import ApprovalPolicy
+        from core.atlas_controller import AtlasController
+        from core.pr_manager import GitHubConfig, PRManager, PRPreparationManager
 
         github_cfg = GitHubConfig.from_env()
         if github_cfg:
             self.pr_manager = PRManager(github_cfg)
+            self.pr_preparation = PRPreparationManager(self.pr_manager)
             logger.info(
                 "GitHub PR manager ready (%s/%s)",
                 github_cfg.owner,
@@ -143,16 +154,41 @@ class Orchestrator:
                 "GITHUB_TOKEN / GITHUB_REPO_OWNER / GITHUB_REPO_NAME not set "
                 "— PR operations disabled"
             )
+            self.pr_preparation = PRPreparationManager(None)
 
+        policy = ApprovalPolicy(self.config.approval)
+        self.approval_engine = ApprovalEngine(
+            policy=policy,
+            slack=self.slack,
+            channel_id=self.config.slack.channel_id,
+            pr_preparation=self.pr_preparation,
+        )
         self.approval_manager = ApprovalManager(
             slack=self.slack,
             channel_id=self.config.slack.channel_id,
+            engine=self.approval_engine,
+        )
+        self.approval_engine.rehydrate_from_tasks(self.tasks.list_all())
+
+        from core.deployment_manager import DeploymentManager
+        from core.deployment_policy import DeploymentPolicy
+
+        self.deployment_manager = DeploymentManager(
+            config=self.config.deployment,
+            policy=DeploymentPolicy(self.config.deployment),
+        )
+        logger.info(
+            "Deployment orchestration active (mock_ci=%s)",
+            self.config.deployment.mock_ci,
         )
 
         self.controller = AtlasController(
             self,
+            approval_engine=self.approval_engine,
             approval_manager=self.approval_manager,
             pr_manager=self.pr_manager,
+            pr_preparation=self.pr_preparation,
+            deployment_manager=self.deployment_manager,
         )
 
         if self.slack and self.config.slack_ready:
@@ -165,6 +201,13 @@ class Orchestrator:
 
         if self.agents:
             logger.info("Agents registered: %s", [a.name for a in self.agents])
+
+        if self.worker_pools and self.worker_pools.enabled:
+            self.worker_pools.sync_from_tasks(self.tasks)
+            logger.info(
+                "Worker pools active: %s",
+                [p.pool_id for p in self.worker_pools.registry.all_pools()],
+            )
 
         if self.config.git.enabled and self.git_safety.git.is_available():
             logger.info("Git safety layer active")
@@ -186,6 +229,9 @@ class Orchestrator:
         if self.runtime and self.config.runtime.enabled:
             await self.runtime.on_tick(self.tasks)
 
+        if self.deployment_manager and self.config.deployment.enabled:
+            await self._process_delivery_queue()
+
         while True:
             if self.runtime and self.config.runtime.enabled:
                 task = self.runtime.next_scheduled_task(self.tasks)
@@ -204,6 +250,12 @@ class Orchestrator:
         cancel_ev = self._get_cancel_event(task.id)
         cancel_ev.clear()
         task.metadata["_cancel_event"] = cancel_ev
+
+        if not await self._assign_worker_pool(task):
+            return
+
+        if not await self._check_pre_execution_approval(task):
+            return
 
         await self._prepare_git_workspace(task)
         await self._prepare_operational_context(task)
@@ -238,6 +290,7 @@ class Orchestrator:
             result = self._cancelled_result(task, previous=result)
 
         self.tasks.attach_result(task.id, result)
+        await self._record_pool_result(task, result)
 
         if result.status == ResultStatus.CANCELLED:
             self.tasks.update_status(task.id, TaskStatus.CANCELLED, error="cancelled")
@@ -255,6 +308,75 @@ class Orchestrator:
             await self._handle_failure_with_recovery(task, result, phase="timeout")
         else:
             await self._handle_failure_with_recovery(task, result, phase="execution")
+
+    async def _assign_worker_pool(self, task) -> bool:
+        """
+        Route task to a worker pool before execution.
+
+        Returns False if no pool is available (task stays pending).
+        """
+        if not self.worker_pools or not self.worker_pools.enabled:
+            return True
+
+        agent = task.metadata.get("agent")
+        if agent == "browser":
+            return True
+
+        decision = self.worker_pools.assign_task(task, self.tasks.list_all())
+        if decision is None:
+            logger.debug(
+                "No worker pool available for task %s — deferring",
+                task.id[:8],
+            )
+            api_pool = self.worker_pools.registry.get("api")
+            if (
+                api_pool
+                and api_pool.busy_count() >= api_pool.config.max_workers
+                and self.slack
+                and self.config.slack_ready
+            ):
+                await self.slack.notify_pool_overloaded("API pool overloaded")
+            return False
+
+        pool = self.worker_pools.bind_task(task, decision)
+        if not pool:
+            return False
+
+        if self.slack and self.config.slack_ready:
+            if decision.overflow:
+                await self.slack.notify_pool_routing(
+                    task,
+                    decision.pool_id,
+                    "Task routed to API pool (priority overflow)",
+                )
+            elif decision.pool_id == "api" and self.worker_pools.auth_monitor.subscription_on_cooldown:
+                await self.slack.notify_pool_exhausted(
+                    "Subscription pool exhausted — routing to API pool"
+                )
+
+        return True
+
+    async def _record_pool_result(self, task, result: TaskResult) -> None:
+        if not self.worker_pools or not self.worker_pools.enabled:
+            return
+        prev_cooldown = self.worker_pools.auth_monitor.subscription_on_cooldown
+        self.worker_pools.record_result(task, result)
+        classification = self.worker_pools.auth_monitor._last_classification
+
+        if (
+            classification
+            and classification.should_cooldown_subscription
+            and not prev_cooldown
+            and self.slack
+            and self.config.slack_ready
+        ):
+            await self.slack.notify_pool_exhausted(
+                "Subscription pool exhausted — routing to API pool"
+            )
+
+        if prev_cooldown and not self.worker_pools.auth_monitor.subscription_on_cooldown:
+            if self.slack and self.config.slack_ready:
+                await self.slack.notify_pool_restored("Subscription pool restored")
 
     async def _prepare_git_workspace(self, task) -> None:
         if task.metadata.get("agent") not in ("claude_code", None):
@@ -563,6 +685,32 @@ class Orchestrator:
         r.finish()
         return r
 
+    async def _check_pre_execution_approval(self, task) -> bool:
+        """Governance gate before agent execution. Returns False if paused."""
+        if not self.approval_engine or not self.config.approval.enabled:
+            return True
+        if task.metadata.get("approval_granted"):
+            return True
+
+        from core.approval_engine import ApprovalPhase
+
+        assessment = self.approval_engine.classify(task, phase="pre_execution")
+        gate = self.approval_engine.evaluate_gate(
+            task, assessment, ApprovalPhase.PRE_EXECUTION
+        )
+        if gate.proceed:
+            return True
+
+        context = self.approval_engine.build_approval_context(
+            task, assessment, ApprovalPhase.PRE_EXECUTION
+        )
+        self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+        await self.tasks.persist(task)
+        await self.approval_engine.pause_for_approval(task, context, update_status=False)
+        if self.slack and self.config.slack_ready:
+            await self.slack.notify_approval_waiting(task, "pre_execution")
+        return False
+
     async def _finalize_success(self, task, result: TaskResult) -> None:
         health = self.git_safety.health.analyze(task, result)
         self.git_safety.health.record(task, health)
@@ -572,9 +720,17 @@ class Orchestrator:
             await agent.on_complete(task, result)
         await self._persist_operational_memory(task, result)
 
+        if self.approval_engine and self.config.approval.enabled:
+            summaries = self.approval_engine.build_change_summaries(task, result)
+            task.metadata["engineering_report"] = {
+                "change_summary": summaries.change_summary,
+                "verification_summary": summaries.verification_summary,
+                "recovery_summary": summaries.recovery_summary,
+            }
+
         branch = task.metadata.get("git", {}).get("branch")
-        if branch and self.pr_manager and self.approval_manager:
-            await self._open_pr_and_request_approval(task, branch)
+        if branch and self.pr_preparation and self.approval_engine:
+            await self._prepare_pr_with_approval_gate(task, branch, result)
             return
 
         self.tasks.update_status(task.id, TaskStatus.COMPLETED)
@@ -585,91 +741,121 @@ class Orchestrator:
             else:
                 await self.slack.notify_task_completed(task, result)
 
-    async def _open_pr_and_request_approval(self, task, branch: str) -> None:
-        """Push branch, create a GitHub PR, and move task to AWAITING_APPROVAL."""
-        repo_path = task.metadata.get("git", {}).get("repo_path")
-        if repo_path:
-            push_result = await self.pr_manager.push_branch(branch, repo_path)
-            if not push_result.success:
-                logger.error(
-                    "Branch push failed for task %s: %s", task.id[:8], push_result.error
-                )
-                if self.slack and self.config.slack_ready:
-                    await self.slack.notify(
-                        f"⚠️ Task `{task.id[:8]}` succeeded but branch push failed: "
-                        f"{push_result.error}\nBranch `{branch}` may need manual push."
-                    )
-                self.tasks.update_status(task.id, TaskStatus.COMPLETED)
-                await self.tasks.persist(task)
-                return
-        else:
-            logger.warning(
-                "No repo_path in task %s git metadata — skipping push", task.id[:8]
+    async def _prepare_pr_with_approval_gate(self, task, branch: str, result: TaskResult) -> None:
+        """branch → checkpoint → modify → verify → summarize → approval → PR prep (no auto-merge)."""
+        from core.approval_engine import ApprovalPhase
+
+        git_meta = task.metadata.get("git", {})
+        repo_path = git_meta.get("repo_path")
+        assessment = self.approval_engine.classify(
+            task, result=result, phase="post_execution"
+        )
+        gate = self.approval_engine.evaluate_gate(
+            task, assessment, ApprovalPhase.PR_CREATION
+        )
+
+        verification_status = (task.metadata.get("verification") or {}).get(
+            "status", "passed" if result.success else "unknown"
+        )
+        title = task.title[:72]
+        body = (
+            f"Automated PR prepared by Atlas (governed — not auto-merged).\n\n"
+            f"**Task:** `{task.id[:8]}`\n"
+            f"**Prompt:** {(task.metadata.get('prompt') or task.description)[:500]}"
+        )
+        candidate = self.pr_preparation.build_candidate(
+            task.id,
+            branch,
+            repo_path=str(repo_path) if repo_path else None,
+            title=title,
+            body=body,
+            verification_status=verification_status,
+            risk_level=assessment.risk_level.value,
+            git_meta=git_meta,
+        )
+        candidate.body = self.pr_preparation.enrich_pr_body(
+            candidate,
+            {
+                "change_summary": task.metadata.get("change_summary", ""),
+                "verification_summary": task.metadata.get("verification_summary", ""),
+                "recovery_summary": task.metadata.get("recovery_summary", ""),
+            },
+        )
+        task.metadata["pr_candidate"] = candidate.to_dict()
+
+        if assessment.risk_level.value == "critical":
+            context = self.approval_engine.build_approval_context(
+                task, assessment, ApprovalPhase.PR_CREATION, result=result
             )
+            self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+            await self.tasks.persist(task)
+            await self.approval_engine.pause_for_approval(task, context)
+            if self.slack and self.config.slack_ready:
+                await self.slack.notify_high_risk_detected(task, assessment.risk_level.value)
+                await self.slack.notify_approval_waiting(task, "pr_creation")
+            return
+
+        if gate.wait_for_approval and not gate.proceed:
+            context = self.approval_engine.build_approval_context(
+                task, assessment, ApprovalPhase.PR_CREATION, result=result
+            )
+            self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+            await self.tasks.persist(task)
+            await self.approval_engine.pause_for_approval(task, context)
+            if self.slack and self.config.slack_ready:
+                await self.slack.notify_approval_waiting(task, "post_execution")
+            return
 
         if repo_path:
-            diff_check = await asyncio.to_thread(
-                __import__("subprocess").run,
-                ["git", "log", "origin/main..HEAD", "--oneline"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if not diff_check.stdout.strip():
+            has_commits = await self.pr_preparation.has_commits_ahead(str(repo_path))
+            if not has_commits:
                 msg = (
                     f"✅ Task `{task.id[:8]}` complete — no code changes to merge, "
                     f"branch is identical to main."
                 )
-                logger.info("Task %s has no new commits vs origin/main — skipping PR", task.id[:8])
+                logger.info("Task %s has no new commits — skipping PR", task.id[:8])
                 self.tasks.update_status(task.id, TaskStatus.COMPLETED)
                 await self.tasks.persist(task)
                 if self.slack and self.config.slack_ready:
                     await self.slack.notify(msg)
                 return
 
-        title = task.title[:72]
-        body = (
-            f"Automated PR opened by Atlas.\n\n"
-            f"**Task:** `{task.id[:8]}`\n"
-            f"**Prompt:** {(task.metadata.get('prompt') or task.description)[:500]}"
-        )
-        pr_result = await self.pr_manager.create_pr(
-            task_id=task.id,
-            branch_name=branch,
-            title=title,
-            body=body,
-        )
-        if not pr_result.success:
-            logger.error(
-                "PR creation failed for task %s: %s", task.id[:8], pr_result.error
-            )
+        prep = await self.pr_preparation.prepare_pr(candidate, push=bool(repo_path), create=True)
+        if not prep.success:
+            logger.error("PR preparation failed for %s: %s", task.id[:8], prep.error)
             if self.slack and self.config.slack_ready:
                 await self.slack.notify(
-                    f"⚠️ Task `{task.id[:8]}` succeeded but PR creation failed: "
-                    f"{pr_result.error}\nBranch `{branch}` ready for manual PR."
+                    f"⚠️ Task `{task.id[:8]}` succeeded but PR preparation failed: "
+                    f"{prep.error}\nBranch `{branch}` may need manual PR."
                 )
             self.tasks.update_status(task.id, TaskStatus.COMPLETED)
             await self.tasks.persist(task)
             return
 
-        task.metadata["pr_number"] = pr_result.pr_number
-        task.metadata["pr_url"] = pr_result.pr_url
-        self.tasks.update_status(task.id, TaskStatus.AWAITING_APPROVAL)
-        await self.tasks.persist(task)
+        if prep.candidate:
+            task.metadata["pr_number"] = prep.candidate.pr_number
+            task.metadata["pr_url"] = prep.candidate.pr_url
+            task.metadata["pr_candidate"] = prep.candidate.to_dict()
 
-        approval = await self.approval_manager.request_approval(
-            task_id=task.id,
-            pr_url=pr_result.pr_url,
-            pr_number=pr_result.pr_number,
-            branch_name=branch,
+        context = self.approval_engine.build_approval_context(
+            task, assessment, ApprovalPhase.PR_CREATION, result=result
         )
-        if not approval.success:
-            logger.error(
-                "Approval request failed for task %s: %s", task.id[:8], approval.error
-            )
+        if prep.candidate:
+            context.pr_url = prep.candidate.pr_url
+            context.pr_number = prep.candidate.pr_number
+
+        self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+        await self.tasks.persist(task)
+        await self.approval_engine.pause_for_approval(task, context)
+
+        if self.slack and self.config.slack_ready:
+            await self.slack.notify_pr_candidate_prepared(task, prep.candidate)
+            await self.slack.notify_approval_waiting(task, "pr_merge")
+
         logger.info(
-            "Task %s awaiting approval — PR #%s", task.id[:8], pr_result.pr_number
+            "Task %s PR candidate prepared — awaiting approval (PR #%s)",
+            task.id[:8],
+            prep.candidate.pr_number if prep.candidate else "?",
         )
 
     async def _finalize_failure(
@@ -776,6 +962,147 @@ class Orchestrator:
 
         all_suggestions.sort(key=lambda s: 0 if s.priority == "high" else 1)
         return format_suggestions(all_suggestions[:5], scanned=list(projects.keys()))
+
+    async def _process_delivery_queue(self) -> None:
+        """Advance in-flight delivery tasks (Phase 15)."""
+        from core.deployment_manager import DeploymentAction
+        from core.deployment_state import DELIVERY_STATUSES
+
+        dm = self.deployment_manager
+        if not dm:
+            return
+
+        for task in self.tasks.list_in_delivery():
+            if task.status not in DELIVERY_STATUSES:
+                continue
+            if task.metadata.get("_delivery_processing"):
+                continue
+
+            task.metadata["_delivery_processing"] = True
+            try:
+                step = await dm.process_delivery_task(task)
+                await self._handle_deployment_step(task, step)
+            except Exception:
+                logger.exception("Delivery step failed for %s", task.id[:8])
+            finally:
+                task.metadata.pop("_delivery_processing", None)
+                await self.tasks.persist(task)
+
+    async def _handle_deployment_step(self, task, step) -> None:
+        from core.deployment_manager import DeploymentAction
+
+        dm = self.deployment_manager
+        if not dm:
+            return
+
+        if step.action == DeploymentAction.NEEDS_STAGING_VERIFY:
+            if task.metadata.pop("_notify_staging_deployed", None):
+                if self.slack and self.config.slack_ready:
+                    url = task.metadata.get("staging_url", "")
+                    await self.slack.notify_staging_deployed(task, url)
+            if self.config.deployment.staging_verify_enabled:
+                await self._run_deployment_verification(task, environment="staging")
+            return
+
+        if step.action == DeploymentAction.NEEDS_PRODUCTION_VERIFY:
+            await self._run_deployment_verification(task, environment="production")
+            return
+
+        if step.action == DeploymentAction.NEEDS_PRODUCTION_APPROVAL:
+            if self.slack and self.config.slack_ready:
+                await self.slack.notify_production_approval_required(task)
+            return
+
+        if step.action == DeploymentAction.FAILED:
+            if self.slack and self.config.slack_ready:
+                if "ci" in step.message.lower():
+                    await self.slack.notify_ci_failed(task, step.message)
+                else:
+                    await self.slack.notify_deployment_failed(task, step.message)
+            return
+
+        if step.action == DeploymentAction.ROLLED_BACK:
+            if self.slack and self.config.slack_ready:
+                await self.slack.notify_deployment_rollback(task, step.message)
+            return
+
+        if step.action == DeploymentAction.COMPLETE:
+            if self.slack and self.config.slack_ready:
+                await self.slack.notify_deployment_succeeded(task)
+            return
+
+        if step.action == DeploymentAction.ADVANCE:
+            follow = await dm.process_delivery_task(task)
+            await self._handle_deployment_step(task, follow)
+
+    async def _run_deployment_verification(self, task, *, environment: str) -> None:
+        """Run browser verification against staging or production URL."""
+        dm = self.deployment_manager
+        if not dm:
+            return
+
+        if environment == "staging":
+            verify_meta = dm.build_staging_verify_metadata(task)
+        else:
+            verify_meta = dm.build_production_verify_metadata(task)
+
+        browser_agent = self._find_agent_by_name("browser")
+        if not browser_agent:
+            report = {"status": "skipped", "reason": "browser agent unavailable"}
+            if environment == "staging":
+                dm.apply_staging_verification_result(task, True, report)
+            else:
+                dm.apply_production_verification_result(task, True, report)
+            return
+
+        verify_task = self.tasks.create(
+            title=f"Deploy verify ({environment}): {task.title[:30]}",
+            description=f"Deployment verification for {environment}",
+            project_id=task.project_id,
+            metadata=verify_meta,
+        )
+        verify_task.metadata["parent_task_id"] = task.id
+        verify_task.metadata["deployment_parent"] = task.id
+
+        verify_result = await browser_agent.run(verify_task)
+        self.tasks.attach_result(verify_task.id, verify_result)
+        report = {
+            "status": "passed" if verify_result.success else "failed",
+            "environment": environment,
+            "child_task_id": verify_task.id,
+            "summary": verify_result.summary,
+            "result": verify_result.to_dict(),
+        }
+
+        if environment == "staging":
+            step = dm.apply_staging_verification_result(
+                task, verify_result.success, report
+            )
+        else:
+            step = dm.apply_production_verification_result(
+                task, verify_result.success, report
+            )
+
+        await self.tasks.persist(task)
+        await self._handle_deployment_step(task, step)
+
+        if not verify_result.success and self.slack and self.config.slack_ready:
+            await self.slack.notify_staging_verification_failed(task, verify_result.summary)
+
+    async def start_delivery_for_task(self, task) -> bool:
+        """Begin delivery pipeline after merge — called from controller."""
+        if not self.deployment_manager or not self.config.deployment.enabled:
+            return False
+        if not self.config.deployment.auto_start_after_merge:
+            return False
+        if task.metadata.get("deployment"):
+            return False
+
+        self.deployment_manager.start_delivery_pipeline(task)
+        await self.tasks.persist(task)
+        if self.slack and self.config.slack_ready:
+            await self.slack.notify_ci_started(task)
+        return True
 
     async def _persist_result(self, task, result: TaskResult) -> None:
         await self._persist_operational_memory(task, result)

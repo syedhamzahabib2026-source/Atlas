@@ -19,6 +19,7 @@ from slack.commands import parse_atlas_command
 from slack.security import is_authorized
 
 if TYPE_CHECKING:
+    from core.approval_engine import ApprovalContext
     from core.atlas_controller import AtlasController
     from core.task_manager import Task
 
@@ -476,6 +477,174 @@ class SlackBot:
         await self.notify(
             f":warning: *Atlas integrity check failed*\n"
             + "\n".join(f"• {i}" for i in issues[:8])
+        )
+
+    async def notify_pool_exhausted(self, message: str) -> None:
+        await self.notify(f":warning: *{message}*")
+
+    async def notify_pool_restored(self, message: str) -> None:
+        await self.notify(f":white_check_mark: *{message}*")
+
+    async def notify_pool_overloaded(self, message: str) -> None:
+        await self.notify(f":warning: *{message}*")
+
+    async def notify_pool_routing(
+        self, task: Task, pool_id: str, message: str
+    ) -> None:
+        await self.notify(
+            f"*{message}*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• pool: `{pool_id}`",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_approval_required(self, task: Task, context: ApprovalContext) -> str | None:
+        """Rich approval prompt with risk, summaries, and commands."""
+        engine = None
+        if self._controller and self._controller.approval_engine:
+            engine = self._controller.approval_engine
+        text = (
+            engine.format_slack_message(task, context)
+            if engine
+            else f"*Approval required* for task `{task.id[:8]}`"
+        )
+        return await self.notify(
+            text,
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_approval_waiting(self, task: Task, phase: str) -> None:
+        await self.notify(
+            f"*Task waiting for approval*\n"
+            f"• id: `{task.id[:8]}`\n"
+            f"• phase: `{phase}`\n"
+            f"• risk: `{(task.metadata.get('risk') or {}).get('risk_level', 'unknown')}`",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_high_risk_detected(self, task: Task, risk_level: str) -> None:
+        await self.notify(
+            f":warning: *High-risk change detected*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• risk: `{risk_level}`\n"
+            f"_Manual review required before proceeding._",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_pr_candidate_prepared(self, task: Task, candidate) -> None:
+        if not candidate:
+            return
+        pr_url = getattr(candidate, "pr_url", None) or task.metadata.get("pr_url")
+        branch = getattr(candidate, "branch_name", None) or task.metadata.get("git", {}).get("branch")
+        await self.notify(
+            f"*PR candidate prepared*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• branch: `{branch}`\n"
+            f"• PR: {pr_url or 'not created yet'}\n"
+            f"_Awaiting approval — not auto-merged._",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_approval_rejected(self, task: Task, reason: str) -> None:
+        await self.notify(
+            f"*Approval rejected*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• reason: {reason[:500]}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_task_resumed_after_approval(self, task: Task) -> None:
+        await self.notify(
+            f"*Task resumed after approval*\n"
+            f"• id: `{task.id[:8]}`\n"
+            f"• title: {task.title[:60]}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_ci_started(self, task: Task) -> None:
+        dep = task.metadata.get("deployment", {})
+        await self.notify(
+            f"*CI started*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• release: `{dep.get('release_id', '?')[:8]}`\n"
+            f"• branch: `{dep.get('branch', 'n/a')}`",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_ci_failed(self, task: Task, reason: str) -> None:
+        await self.notify(
+            f"*CI failed*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• {reason[:500]}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_staging_deployed(self, task: Task, url: str) -> None:
+        await self.notify(
+            f"*Staging deployed*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• url: {url}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_staging_verification_failed(self, task: Task, reason: str) -> None:
+        await self.notify(
+            f"*Staging verification failed*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• {reason[:500]}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_production_approval_required(self, task: Task) -> None:
+        dep = task.metadata.get("deployment", {})
+        await self.notify(
+            f"*Production approval required*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• risk: `{dep.get('deployment_risk', '?')}`\n"
+            f"• staging: `{dep.get('staging_url', 'n/a')}`\n"
+            f"Reply: `/atlas approve_deploy {task.id[:8]}`",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_deployment_succeeded(self, task: Task) -> None:
+        dep = task.metadata.get("deployment", {})
+        await self.notify(
+            f"*Deployment succeeded*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• production: `{dep.get('production_url', 'n/a')}`\n"
+            f"• health: `{dep.get('health_status', '?')}`",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_deployment_failed(self, task: Task, reason: str) -> None:
+        await self.notify(
+            f"*Deployment failed*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• {reason[:500]}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
+        )
+
+    async def notify_deployment_rollback(self, task: Task, reason: str) -> None:
+        await self.notify(
+            f"*Rollback triggered*\n"
+            f"• task: `{task.id[:8]}`\n"
+            f"• {reason[:500]}",
+            channel_id=task.metadata.get("slack_channel_id"),
+            thread_ts=task.metadata.get("slack_thread_ts"),
         )
 
     async def notify_escalation(self, task: Task, summary: str) -> None:

@@ -5,6 +5,7 @@ from core.logger import setup_logging, get_logger
 from core.task_manager import TaskManager, Task, TaskStatus
 from core.task_result import TaskResult, ResultStatus
 from core.orchestrator import Orchestrator
+from core.worker_pool_manager import WorkerPoolManager
 
 __all__ = [
     "AtlasConfig",
@@ -17,4 +18,5 @@ __all__ = [
     "TaskResult",
     "ResultStatus",
     "Orchestrator",
+    "WorkerPoolManager",
 ]

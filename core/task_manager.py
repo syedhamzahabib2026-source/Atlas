@@ -24,11 +24,39 @@ class TaskStatus(str, Enum):
     RETRYING = "retrying"
     INVESTIGATING = "investigating"
     BLOCKED = "blocked"
-    AWAITING_APPROVAL = "awaiting_approval"
+    WAITING_APPROVAL = "waiting_approval"
+    AWAITING_APPROVAL = "waiting_approval"  # legacy alias (Phase 14)
+    APPROVED = "approved"
+    REJECTED = "rejected"
     COMPLETED = "completed"
     MERGED = "merged"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # Phase 15 — delivery / deployment lifecycle
+    CI_PENDING = "ci_pending"
+    CI_RUNNING = "ci_running"
+    CI_FAILED = "ci_failed"
+    STAGING_DEPLOYING = "staging_deploying"
+    STAGING_VERIFYING = "staging_verifying"
+    STAGING_FAILED = "staging_failed"
+    READY_FOR_PRODUCTION = "ready_for_production"
+    PRODUCTION_PENDING_APPROVAL = "production_pending_approval"
+    PRODUCTION_DEPLOYING = "production_deploying"
+    PRODUCTION_VERIFYING = "production_verifying"
+    DEPLOYED = "deployed"
+    DEPLOYMENT_FAILED = "deployment_failed"
+    ROLLED_BACK = "rolled_back"
+
+
+# Durable wait states — not picked up by next_pending()
+APPROVAL_WAIT_STATUSES = frozenset({
+    TaskStatus.WAITING_APPROVAL,
+})
+
+DELIVERY_WAIT_STATUSES = frozenset({
+    TaskStatus.PRODUCTION_PENDING_APPROVAL,
+    TaskStatus.READY_FOR_PRODUCTION,
+})
 
 
 # Populated after class body
@@ -171,6 +199,20 @@ class TaskManager:
         task.touch()
         self._schedule_persist(task)
         return task
+
+    def list_waiting_approval(self) -> list[Task]:
+        return [
+            t for t in self._tasks.values()
+            if t.status in APPROVAL_WAIT_STATUSES
+        ]
+
+    def list_rejected(self) -> list[Task]:
+        return [t for t in self._tasks.values() if t.status == TaskStatus.REJECTED]
+
+    def list_in_delivery(self) -> list[Task]:
+        from core.deployment_state import DELIVERY_STATUSES
+
+        return [t for t in self._tasks.values() if t.status in DELIVERY_STATUSES]
 
     def next_pending(self) -> Task | None:
         """Return oldest pending or retrying task."""

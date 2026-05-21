@@ -68,6 +68,16 @@ class TaskStore:
         TaskStatus.RETRYING,
         TaskStatus.INVESTIGATING,
         TaskStatus.BLOCKED,
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.APPROVED,
+        TaskStatus.CI_PENDING,
+        TaskStatus.CI_RUNNING,
+        TaskStatus.STAGING_DEPLOYING,
+        TaskStatus.STAGING_VERIFYING,
+        TaskStatus.READY_FOR_PRODUCTION,
+        TaskStatus.PRODUCTION_PENDING_APPROVAL,
+        TaskStatus.PRODUCTION_DEPLOYING,
+        TaskStatus.PRODUCTION_VERIFYING,
     )
 
     def __init__(self, db_path: Path) -> None:
@@ -104,12 +114,15 @@ class TaskStore:
 
     def _row_to_task(self, row: sqlite3.Row) -> Task:
         meta = json.loads(row["metadata_json"] or "{}")
+        raw_status = row["status"]
+        if raw_status == "awaiting_approval":
+            raw_status = TaskStatus.WAITING_APPROVAL.value
         return Task(
             id=row["id"],
             title=row["title"],
             description=row["description"] or "",
             project_id=row["project_id"],
-            status=TaskStatus(row["status"]),
+            status=TaskStatus(raw_status),
             created_at=datetime.fromisoformat(row["created_at"]),
             started_at=(
                 datetime.fromisoformat(row["started_at"])

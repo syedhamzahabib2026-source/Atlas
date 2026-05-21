@@ -1,22 +1,26 @@
 # Atlas — Master Context Document
 
 Last updated: 2026-05-21  
-Current phase: **11 complete**  
+Current phase: **13 complete**  
 Repo: `https://github.com/syedhamzahabib2026-source/Atlas`  
-Primary project target: `C:\Users\shamz\Desktop\Assignmint`
+Primary project target: `C:\Users\shamz\Desktop\Assignmint`  
+Phase timeline: [ATLAS_PHASES.md](ATLAS_PHASES.md)
 
 ---
 
 ## What Atlas Is
 
-Atlas is an autonomous AI engineering operating system. It receives tasks via Slack, runs Claude Code in isolated tmux sessions, manages git safety, handles failures with a recovery engine, and closes the PR lifecycle — all without human intervention beyond approving the final PR.
+Atlas is an autonomous AI engineering operating system — **provider-agnostic orchestration infrastructure** with a **multi-pool runtime** and **workload router**. It is not a single-worker execution script.
+
+It receives tasks via Slack, routes them to the right worker pool (subscription-first, API fallback), runs Claude Code in **pool-isolated** tmux sessions, manages git safety, handles failures with a recovery engine, and closes the PR lifecycle — all without human intervention beyond approving the final PR.
 
 The operator sends `/atlas start --project assignmint <prompt>` from Slack. Atlas:
 1. Creates a task, isolates a git branch in the target repo
-2. Launches Claude Code in a tmux session with operational memory injected
-3. Monitors execution, retries failures with escalating strategies
-4. On success: pushes the branch, opens a GitHub PR, posts to Slack for approval
-5. On `/atlas approve`: merges the PR, marks the task MERGED
+2. **Routes** the task to a worker pool (`WorkerRouter` → `SubscriptionPool` or `ApiPool`)
+3. Launches Claude Code in a pool-scoped tmux session (`atlas-sub-*` or `atlas-api-*`) with operational memory injected
+4. Monitors execution, retries failures with escalating strategies; on subscription exhaustion, overflows to API pool without restarting Atlas
+5. On success: pushes the branch, opens a GitHub PR, posts to Slack for approval
+6. On `/atlas approve`: merges the PR, marks the task MERGED
 
 ---
 
@@ -53,7 +57,13 @@ Atlas/
 │   ├── runtime_recovery.py        # Boot-time state normalisation
 │   ├── resource_manager.py        # Per-resource concurrency slots
 │   ├── project_scheduler.py       # Per-project concurrency limits
-│   ├── dashboard.py               # `--dashboard` CLI output
+│   ├── dashboard.py               # `--dashboard` CLI output (includes worker pools)
+│   ├── pool_config.py             # Pool types, capabilities, YAML config (Phase 13)
+│   ├── worker_pool.py             # SubscriptionPool, ApiPool, LocalPool placeholder
+│   ├── worker_registry.py         # Registers pools, syncs active workers
+│   ├── worker_router.py           # Subscription-first routing decisions
+│   ├── auth_monitor.py            # Centralized auth exhaustion + cooldowns
+│   ├── worker_pool_manager.py     # Facade: registry + router + per-pool tmux
 │   ├── future_systems.py          # Stub registry for planned systems
 │   ├── task_result.py             # TaskResult + ResultStatus
 │   ├── browser_result.py          # Browser-specific result model
@@ -146,6 +156,49 @@ Closes the loop on Phase 10: lessons that correlate with task success get booste
 `ContextBuilder.build_for_task()` now calls `get_global_lessons()` with `return_ids=True` (single query, no second round-trip) and writes the returned IDs into `task.metadata["injected_lesson_ids"]`. At teardown, `MemorySummarizer.extract_from_task()` reads those IDs and calls `update_lesson_signal(lesson_id, succeeded)` for each one — nudging `signal_score` ±5, clamped 0–100, and incrementing `access_count`.
 
 `LessonExtractor.retire_weak_lessons()` deletes any global lesson with `signal_score < 25` AND `access_count >= 5` — it's been applied repeatedly and never helped. Called non-fatally at the end of every `maybe_promote()` so cleanup is automatic and never blocks task teardown.
+
+### Phase 12 — Proactive Task Suggestions
+`core/task_scanner.py`, background scanner loop in `orchestrator.py`, `/atlas scan`  
+Scans risk zones, failure patterns, and global warnings; surfaces actionable `/atlas start` suggestions on a schedule and on demand.
+
+### Phase 13 — Worker Pool Orchestration
+`core/pool_config.py`, `core/worker_pool.py`, `core/worker_registry.py`, `core/worker_router.py`, `core/auth_monitor.py`, `core/worker_pool_manager.py`  
+Multi-pool workload routing: separate tmux namespaces, auth contexts, and concurrency per pool. Subscription-first; API overflow on exhaustion. See [Phase 13 section](#phase-13--worker-pool-orchestration) below.
+
+---
+
+## Architecture — Multi-Pool Orchestration (Phase 13)
+
+Atlas routes work **before** agents execute. Routing lives in `WorkerRouter`; agents only run tasks already bound to a pool.
+
+```
+Slack / CLI
+    ↓
+Orchestrator (lifecycle only)
+    ↓
+WorkerRouter  ← capabilities, priority, availability, cooldown, cost tier
+    ↓
+WorkerPools
+├── SubscriptionPool   (atlas-sub-*, subscription auth, free tier)
+├── ApiPool            (atlas-api-*, ANTHROPIC_API_KEY, metered)
+└── LocalPool          (placeholder — Ollama/OpenAI/Gemini future)
+
+AuthMonitor  ← auth exhaustion only (not routing, not execution)
+    ↓
+ClaudeCodeAgent / BrowserTaskAgent  ← execution only
+```
+
+**Separation of concerns (do not blur):**
+
+| Component | Owns |
+|-----------|------|
+| `WorkerPool` | Slot tracking, metrics, pool health, cooldown state |
+| `WorkerRouter` | Which pool gets the task |
+| `AuthMonitor` | Auth failure classification, subscription cooldown |
+| `Orchestrator` | Task lifecycle, recovery, PR flow |
+| `Agents` | tmux/Playwright execution only |
+
+Config: `configs/default.yaml` → `worker_pools:` (`subscription`, `api`, `local`).
 
 ---
 
@@ -296,7 +349,9 @@ Do not finish without committing.
 
 **Git safety works on the target repo, not Atlas.** The Atlas repo itself is never touched by task branches. Only the configured project repos get isolated branches.
 
-**tmux session naming:** Sessions are named `atlas-<project_id>`. So `--project assignmint` → session `atlas-assignmint`. Without `--project`, the session is named `atlas-slack-<user_id>`.
+**tmux session naming (Phase 13):** Pool-scoped prefixes. Subscription pool: `atlas-sub-<project_id>` (e.g. `atlas-sub-assignmint`). API pool: `atlas-api-<project_id>`. Legacy default prefix `atlas` still exists on the root `TmuxManager` for non-pooled paths. Task metadata carries `worker_pool`, `session_prefix`, `pool_auth_mode`, `pool_cost_tier` after routing.
+
+**Worker pools over auth hacking:** Claude Code auth is static per process (subscription login OR API key; API key overrides subscription). Atlas does not switch auth inside one worker — it maintains **separate pools** with isolated launch commands and tmux namespaces.
 
 ---
 
@@ -389,6 +444,8 @@ SQLite at `memory/atlas.db`. Five tables in `operational_memories` schema plus d
 9. **PowerShell here-strings for multi-line git commits.** Bash `<<'EOF'` heredocs don't work in PowerShell. Always use `@'...'@`.
 
 10. **One Atlas process at a time.** Kill all existing `python main.py` processes before starting a new one. Multiple instances will fight over the same SQLite DB and tmux sessions.
+
+11. **Worker pools, not auth hacks (Phase 13).** Route tasks via `WorkerRouter`; never embed pool selection inside agents. `AuthMonitor` owns cooldowns; `Orchestrator` owns lifecycle only.
 
 ---
 
@@ -529,3 +586,131 @@ Returns up to 5 prioritised `Suggestion` objects with ready-to-run `/atlas start
 Atlas became: **a system that notices things for you.**
 
 Shift from tool you command → system that works for you.
+
+---
+
+## Phase 13 — Worker Pool Orchestration
+
+### Why Phase 13 existed
+
+- **Claude auth switching inside one worker was brittle** — API keys override subscription login in the same CLI session.
+- Atlas needed **workload routing**, not runtime auth hacks.
+- Goal became **provider-agnostic orchestration**: think in terms of capabilities and pools, not a single Claude session.
+
+### What was built
+
+| Module | Responsibility |
+|--------|----------------|
+| `core/pool_config.py` | Pool types, auth modes, capabilities, `worker_pools` YAML |
+| `core/worker_pool.py` | `SubscriptionPool`, `ApiPool`, `LocalPool` placeholder; metrics; cooldowns |
+| `core/worker_registry.py` | Register pools, capability matching, active-worker sync |
+| `core/worker_router.py` | Subscription-first routing; overflow to API |
+| `core/auth_monitor.py` | Centralized exhaustion detection; subscription cooldown |
+| `core/worker_pool_manager.py` | Facade: per-pool `TmuxManager`, router, auth monitor |
+
+Wired into `orchestrator._assign_worker_pool()`, `agents/claude_code.py` (pool tmux + launch command), `main.py`, `core/dashboard.py`, `slack/bot.py`.
+
+### Pool types
+
+| Pool | Auth | Cost tier | Status |
+|------|------|-----------|--------|
+| **SubscriptionPool** | Claude subscription login (no API key in launch) | Free | Active |
+| **ApiPool** | `ANTHROPIC_API_KEY` injected at launch | Metered | Active fallback |
+| **LocalPool** | Local models (future) | Cheap | Placeholder only |
+
+### Routing philosophy
+
+`WorkerRouter` selects a pool using:
+
+- **Capabilities** — `metadata.capabilities` / `required_capabilities` (e.g. `deep_reasoning`, `repo_analysis`)
+- **Availability** — idle slots vs `max_workers`
+- **Priority** — high `metadata.priority` can justify API overflow
+- **Cost tier** — subscription preferred when healthy
+- **Cooldown state** — subscription skipped while `AuthMonitor` has it on cooldown
+- **Explicit override** — `metadata.worker_pool` or `metadata.pool`
+
+Default order: subscription → API → local (skipped).
+
+If no pool is available, the task **stays pending** — Atlas does not restart the whole runtime.
+
+### Pool isolation
+
+Each pool has:
+
+- **Separate tmux namespace** — dedicated `TmuxManager` per pool (`session_prefix`)
+- **Separate session prefixes** — `atlas-sub-*`, `atlas-api-*`, `atlas-local-*` (future)
+- **Separate auth context** — subscription launches `claude`; API launches `ANTHROPIC_API_KEY=... claude`
+- **Separate runtime metadata** on the task — `worker_pool`, `session_prefix`, `pool_auth_mode`, `routing_reason`, `routing_overflow`
+
+### Auth monitoring
+
+`AuthMonitor` centralizes heuristics (rate limit, quota, `429`, auth markers) — **not** scattered string matching in agents.
+
+On likely subscription exhaustion:
+
+1. Mark subscription pool **cooldown** (default 600s, configurable)
+2. Router sends new tasks to **API pool**
+3. Slack: *Subscription pool exhausted — routing to API pool*
+
+On cooldown expiry or subscription success:
+
+- Pool restored automatically
+- Slack: *Subscription pool restored*
+
+### Dashboard additions
+
+`python main.py --dashboard` now includes **WORKER POOLS**:
+
+- Per-pool health, busy/max workers, availability
+- Cooldown remaining and reason
+- Queued task hint per pool
+
+### Slack additions
+
+| Notification | When |
+|--------------|------|
+| Pool exhausted | Subscription cooldown triggered |
+| Pool restored | Subscription cooldown cleared |
+| API overloaded | No pool slot available (API saturated) |
+| Pool routing | Task explicitly overflowed to API (per-task) |
+
+Methods: `notify_pool_exhausted`, `notify_pool_restored`, `notify_pool_overloaded`, `notify_pool_routing`.
+
+### Future hooks
+
+`LocalPool` and `core/future_systems.py` document placeholders for OpenAI, Gemini, Ollama, distributed workers, cloud runners, dynamic cost optimization — **not implemented**.
+
+---
+
+## Current Status of Atlas
+
+Atlas now includes:
+
+- orchestration
+- runtime persistence
+- adaptive recovery
+- rollback safety
+- operational memory
+- **worker pools**
+- **provider routing**
+- **auth-aware workload distribution**
+- Slack control infrastructure
+- multi-project scheduling
+- autonomous PR lifecycle
+- human approval workflows
+- cross-project intelligence + lesson quality loop
+- proactive task suggestions
+
+Atlas is **multi-pool autonomous engineering orchestration**, not a single-worker Claude wrapper.
+
+---
+
+## Current Priorities
+
+1. **Approval workflows** — polish `/atlas approve` / `reject` UX and edge cases
+2. **PR lifecycle** — reliable push, empty-diff detection, multi-repo config
+3. **Deployment safety** — CI/CD hooks (future_systems placeholders)
+4. **AssignMint operational testing** — end-to-end runs via subscription then API pool
+5. **Runtime hardening** — graceful shutdown, orphan tmux, stale task cleanup
+6. **Worker pool refinement** — saturation metrics, cost-aware routing prep
+7. **tmux/WSL operational setup** — reliable session create/list on Windows+WSL

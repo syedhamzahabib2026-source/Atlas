@@ -75,6 +75,47 @@ projects:
     repo_path: "C:/Users/shamz/Desktop/Assignmint"
     description: "AssignMint web app"
 
+# Worker pools — subscription-first routing, API fallback (Phase 13)
+worker_pools:
+  enabled: true
+  subscription:
+    pool_id: subscription
+    session_prefix: atlas-sub
+    max_workers: 2
+    priority: 10
+    cooldown_sec: 600
+  api:
+    pool_id: api
+    session_prefix: atlas-api
+    max_workers: 2
+    priority: 20
+    cooldown_sec: 300
+  local:
+    pool_id: local
+    enabled: false
+    session_prefix: atlas-local
+    max_workers: 0
+
+deployment:
+  enabled: true
+  auto_start_after_merge: true
+  mock_ci: true
+  mock_deploy: true
+  staging_url_template: "https://staging.example.com"
+  production_url_template: "https://app.example.com"
+  staging_verify_enabled: true
+  production_requires_approval: true
+  never_auto_deploy_critical: true
+
+approval:
+  enabled: true
+  auto_approve_low_risk: true
+  require_approval_high_risk: true
+  require_approval_for_dependencies: true
+  require_approval_for_deployments: true
+  escalate_on_high_rollback_count: 3
+  escalate_on_excessive_retries: 6
+
 scanner:
   interval_hours: 6             # background scan frequency (0 = disable background loop)
   enabled: true                 # set false to disable proactive Slack suggestions entirely

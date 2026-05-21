@@ -20,7 +20,7 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -310,3 +310,182 @@ class PRManager:
         except Exception as exc:
             logger.exception("get_pr_status #%s unexpected error", pr_number)
             return PRStatusResult(success=False, error=str(exc))
+
+
+# ── PR preparation lifecycle (Phase 14) ───────────────────────────────────────
+# GitHub API client above; preparation flow below. Does NOT merge automatically.
+
+
+@dataclass
+class PRCandidate:
+    """PR-ready work package — safe preparation without auto-merge."""
+
+    task_id: str
+    branch_name: str
+    repo_path: str | None
+    title: str
+    body: str
+    verification_status: str = "unknown"
+    approval_status: str = "pending"
+    risk_level: str = "low"
+    checkpoint_refs: list[str] = field(default_factory=list)
+    pr_number: int | None = None
+    pr_url: str | None = None
+    prepared_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "branch_name": self.branch_name,
+            "repo_path": self.repo_path,
+            "title": self.title,
+            "body": self.body,
+            "verification_status": self.verification_status,
+            "approval_status": self.approval_status,
+            "risk_level": self.risk_level,
+            "checkpoint_refs": self.checkpoint_refs,
+            "pr_number": self.pr_number,
+            "pr_url": self.pr_url,
+            "prepared_at": self.prepared_at,
+        }
+
+
+@dataclass
+class PRPreparationResult:
+    success: bool
+    candidate: PRCandidate | None = None
+    pushed: bool = False
+    pr_created: bool = False
+    error: str | None = None
+    skip_reason: str | None = None
+
+
+class PRPreparationManager:
+    """
+    PR preparation lifecycle only: branch → checkpoint → modify → verify → summarize → approval → PR prep.
+
+    Does NOT auto-merge. Delegates GitHub HTTP to PRManager (GitHub client).
+    """
+
+    def __init__(self, github: PRManager | None) -> None:
+        self.github = github
+
+    def build_candidate(
+        self,
+        task_id: str,
+        branch: str,
+        *,
+        repo_path: str | None,
+        title: str,
+        body: str,
+        verification_status: str = "unknown",
+        risk_level: str = "low",
+        git_meta: dict[str, Any] | None = None,
+    ) -> PRCandidate:
+        from datetime import datetime, timezone
+
+        checkpoints = (git_meta or {}).get("checkpoints", [])
+        refs = [c.get("commit_hash", "")[:12] for c in checkpoints if c.get("commit_hash")]
+        return PRCandidate(
+            task_id=task_id,
+            branch_name=branch,
+            repo_path=repo_path,
+            title=title[:72],
+            body=body,
+            verification_status=verification_status,
+            approval_status="pending",
+            risk_level=risk_level,
+            checkpoint_refs=refs,
+            prepared_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def enrich_pr_body(self, candidate: PRCandidate, summaries: dict[str, str]) -> str:
+        """Append engineering summaries to PR description."""
+        parts = [candidate.body, "", "---", "*Atlas change summary*"]
+        if summaries.get("change_summary"):
+            parts.append(summaries["change_summary"][:2000])
+        if summaries.get("verification_summary"):
+            parts.append(f"\n*Verification:* {summaries['verification_summary']}")
+        if summaries.get("recovery_summary"):
+            parts.append(f"\n*Recovery:* {summaries['recovery_summary']}")
+        if candidate.checkpoint_refs:
+            parts.append(f"\n*Rollback checkpoints:* {', '.join(candidate.checkpoint_refs)}")
+        return "\n".join(parts)
+
+    async def prepare_pr(
+        self,
+        candidate: PRCandidate,
+        *,
+        push: bool = True,
+        create: bool = True,
+        draft: bool = False,
+    ) -> PRPreparationResult:
+        """
+        Push branch and open PR if configured. Never merges.
+
+        Flow: branch → (already modified) → verify → summarize → approval → PR prep
+        """
+        if not self.github:
+            return PRPreparationResult(
+                success=False,
+                error="GitHub PR client not configured",
+            )
+
+        if push and candidate.repo_path:
+            push_result = await self.github.push_branch(
+                candidate.branch_name, candidate.repo_path
+            )
+            if not push_result.success:
+                return PRPreparationResult(
+                    success=False,
+                    candidate=candidate,
+                    error=push_result.error,
+                )
+
+        if not create:
+            candidate.approval_status = "ready_no_pr"
+            return PRPreparationResult(success=True, candidate=candidate, pushed=push)
+
+        pr_result = await self.github.create_pr(
+            task_id=candidate.task_id,
+            branch_name=candidate.branch_name,
+            title=candidate.title,
+            body=candidate.body,
+            draft=draft,
+        )
+        if not pr_result.success:
+            return PRPreparationResult(
+                success=False,
+                candidate=candidate,
+                pushed=push,
+                error=pr_result.error,
+            )
+
+        candidate.pr_number = pr_result.pr_number
+        candidate.pr_url = pr_result.pr_url
+        candidate.approval_status = "pr_prepared"
+        return PRPreparationResult(
+            success=True,
+            candidate=candidate,
+            pushed=push,
+            pr_created=True,
+        )
+
+    async def has_commits_ahead(self, repo_path: str, base: str = "main") -> bool:
+        """True if branch has commits not on origin/base."""
+        import asyncio
+
+        def _check() -> bool:
+            result = subprocess.run(
+                ["git", "log", f"origin/{base}..HEAD", "--oneline"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return bool(result.stdout.strip())
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception:
+            return True

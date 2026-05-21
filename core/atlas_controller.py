@@ -16,9 +16,11 @@ from core.logger import get_logger
 from core.task_manager import Task, TaskStatus
 from core.task_result import ResultStatus, TaskResult
 if TYPE_CHECKING:
+    from core.approval_engine import ApprovalEngine, ApprovalDecision
     from core.approval_manager import ApprovalManager
+    from core.deployment_manager import DeploymentManager
     from core.orchestrator import Orchestrator
-    from core.pr_manager import PRManager
+    from core.pr_manager import PRManager, PRPreparationManager
 
 logger = get_logger("controller")
 
@@ -29,16 +31,24 @@ class AtlasController:
     def __init__(
         self,
         orchestrator: Orchestrator,
+        approval_engine: ApprovalEngine | None = None,
         approval_manager: ApprovalManager | None = None,
         pr_manager: PRManager | None = None,
+        pr_preparation: PRPreparationManager | None = None,
+        deployment_manager: DeploymentManager | None = None,
     ) -> None:
         self.orchestrator = orchestrator
         self.tasks = orchestrator.tasks
         self.tmux = orchestrator.tmux
         self.config = orchestrator.config
         self.slack = orchestrator.slack
+        self.approval_engine = approval_engine or (
+            approval_manager.engine if approval_manager else None
+        )
         self.approval_manager = approval_manager
         self.pr_manager = pr_manager
+        self.pr_preparation = pr_preparation
+        self.deployment_manager = deployment_manager
 
     def _resolve_task_id(self, token: str | None) -> Task | None:
         if not token:
@@ -125,7 +135,7 @@ class AtlasController:
             tid = parsed.args[0] if parsed.args else None
             if not tid:
                 return "Usage: `/atlas approve <task_id>`"
-            return await self._handle_approve(tid)
+            return await self._handle_approve(tid, user_id=user_id)
 
         if sub == "reject":
             if not parsed.args:
@@ -134,11 +144,35 @@ class AtlasController:
             reason = " ".join(parsed.args[1:]).strip()
             if not reason:
                 return "Usage: `/atlas reject <task_id> <reason>` — reason is required"
-            return await self._handle_reject(tid, reason)
+            return await self._handle_reject(tid, reason, user_id=user_id)
+
+        if sub == "request_changes":
+            if len(parsed.args) < 2:
+                return "Usage: `/atlas request_changes <task_id> <feedback>`"
+            tid = parsed.args[0]
+            feedback = " ".join(parsed.args[1:]).strip()
+            return await self._handle_request_changes(tid, feedback, user_id=user_id)
 
         if sub == "scan":
             project_filter = parsed.args[0] if parsed.args else None
             return await self._handle_scan(project_filter)
+
+        if sub in ("approve_deploy", "approve-deploy"):
+            tid = parsed.args[0] if parsed.args else None
+            if not tid:
+                return "Usage: `/atlas approve_deploy <task_id>`"
+            return await self._handle_approve_deploy(tid, user_id=user_id)
+
+        if sub in ("rollback_release", "rollback-release"):
+            if len(parsed.args) < 2:
+                return "Usage: `/atlas rollback_release <task_id> <reason>`"
+            tid = parsed.args[0]
+            reason = " ".join(parsed.args[1:]).strip()
+            return await self._handle_rollback_release(tid, reason, user_id=user_id)
+
+        if sub in ("deployment_status", "deployment-status", "deploy_status"):
+            tid = parsed.args[0] if parsed.args else None
+            return self._handle_deployment_status(tid)
 
         return f"Unknown subcommand `{sub}`. Try `/atlas help`."
 
@@ -147,12 +181,16 @@ class AtlasController:
             "*Atlas commands*\n"
             "• `/atlas start [--project <name>] <prompt>` — queue a Claude Code task\n"
             "• `/atlas stop [task_id] [--kill]` — cancel running task\n"
-            "• `/atlas approve <task_id>` — merge PR and mark task complete\n"
-            "• `/atlas reject <task_id> <reason>` — send task back for rework\n"
+            "• `/atlas approve <task_id>` — approve changes (merge PR if prepared)\n"
+            "• `/atlas reject <task_id> <reason>` — reject and stop\n"
+            "• `/atlas request_changes <task_id> <feedback>` — send back for rework\n"
             "• `/atlas scan [project]` — proactive memory scan; suggest tasks to run\n"
             "• `/atlas status` — tasks overview\n"
             "• `/atlas sessions` — tmux sessions + tasks\n"
             "• `/atlas logs [task_id]` — recent Atlas log tail\n"
+            "• `/atlas approve_deploy <task_id>` — approve production deployment\n"
+            "• `/atlas rollback_release <task_id> <reason>` — rollback release\n"
+            "• `/atlas deployment_status [task_id]` — delivery / CI status\n"
             "\n_Reply in a blocked task thread to unblock Atlas._"
         )
 
@@ -162,64 +200,168 @@ class AtlasController:
             return "Memory not active — enable `memory.enabled` in config."
         return await self.orchestrator.run_scanner(project_filter)
 
-    async def _handle_approve(self, task_id: str) -> str:
-        if not self.approval_manager:
-            return "Approval manager not configured."
-        if not self.pr_manager:
-            return "PR manager not configured (GITHUB_TOKEN missing?)."
+    async def _handle_approve(self, task_id: str, *, user_id: str | None = None) -> str:
+        from core.approval_engine import ApprovalDecision
 
-        req = self.approval_manager.get_approval(task_id)
-        if not req:
-            return f"No pending approval found for `{task_id}`. Use `/atlas status` to check."
+        engine = self.approval_engine
+        if not engine:
+            return "Approval engine not configured."
 
-        task = self._resolve_task_id(req.task_id)
+        pending = engine.get_pending(task_id)
+        task = self._resolve_task_id(pending.task_id if pending else task_id)
+        if not task:
+            return f"No task found for `{task_id}`."
 
-        merge = await self.pr_manager.merge_pr(req.pr_number)
-        if not merge.success:
-            msg = f"PR merge failed for `{req.task_id[:8]}`: {merge.error}"
+        phase = task.metadata.get("approval_phase", "pr_creation")
+        engine.apply_decision_to_task(
+            task, ApprovalDecision.APPROVE, user_id=user_id
+        )
+        engine.clear_pending(task.id)
+        if self.approval_manager:
+            self.approval_manager.clear_approval(task.id)
+
+        pr_number = task.metadata.get("pr_number") or (pending.pr_number if pending else None)
+
+        if phase == "pre_execution":
+            task.metadata["approval_granted"] = True
+            self.tasks.update_status(task.id, TaskStatus.PENDING, error=None)
+            msg = f"✅ Task `{task.id[:8]}` approved — resuming execution."
             if self.slack:
-                await self.slack.notify(msg)
+                await self.slack.notify_task_resumed_after_approval(task)
+            logger.info("Task %s approved for pre-execution resume", task.id[:8])
             return msg
 
-        if task:
+        if pr_number and self.pr_manager:
+            merge = await self.pr_manager.merge_pr(pr_number)
+            if not merge.success:
+                msg = f"PR merge failed for `{task.id[:8]}`: {merge.error}"
+                if self.slack:
+                    await self.slack.notify(msg)
+                return msg
             self.tasks.update_status(task.id, TaskStatus.MERGED)
+            msg = f"✅ PR #{pr_number} merged — task `{task.id[:8]}` complete."
+            if self.orchestrator.deployment_manager and self.config.deployment.enabled:
+                started = await self.orchestrator.start_delivery_for_task(task)
+                if started:
+                    msg += "\n🚀 Delivery pipeline started (CI pending)."
+        else:
+            self.tasks.update_status(task.id, TaskStatus.COMPLETED)
+            msg = f"✅ Task `{task.id[:8]}` approved — marked complete."
 
-        self.approval_manager.clear_approval(req.task_id)
-
-        msg = f"✅ PR #`{req.pr_number}` merged — task `{req.task_id[:8]}` complete."
         if self.slack:
             await self.slack.notify(msg)
-        logger.info("Task %s approved and merged (PR #%s)", req.task_id[:8], req.pr_number)
+        logger.info("Task %s approved (phase=%s)", task.id[:8], phase)
         return msg
 
-    async def _handle_reject(self, task_id: str, reason: str) -> str:
-        if not self.approval_manager:
-            return "Approval manager not configured."
-
-        req = self.approval_manager.get_approval(task_id)
-        if not req:
-            return f"No pending approval found for `{task_id}`. Use `/atlas status` to check."
-
-        task = self._resolve_task_id(req.task_id)
+    async def _handle_approve_deploy(self, task_id: str, *, user_id: str | None = None) -> str:
+        dm = self.deployment_manager
+        if not dm:
+            return "Deployment manager not configured."
+        task = self._resolve_task_id(task_id)
         if not task:
-            return f"Task `{req.task_id[:8]}` not found in task manager."
+            return f"No task found for `{task_id}`."
+        step = await dm.approve_production_deploy(task, user_id=user_id)
+        await self.tasks.persist(task)
+        await self.orchestrator._handle_deployment_step(task, step)
+        return f"✅ Production deploy approved for `{task.id[:8]}` — {step.message}"
 
-        self.approval_manager.clear_approval(req.task_id)
+    async def _handle_rollback_release(
+        self, task_id: str, reason: str, *, user_id: str | None = None
+    ) -> str:
+        dm = self.deployment_manager
+        if not dm:
+            return "Deployment manager not configured."
+        task = self._resolve_task_id(task_id)
+        if not task:
+            return f"No task found for `{task_id}`."
+        step = await dm.rollback_release(task, reason)
+        await self.tasks.persist(task)
+        await self.orchestrator._handle_deployment_step(task, step)
+        return f"↩️ Rollback for `{task.id[:8]}`: {step.message}"
+
+    def _handle_deployment_status(self, task_id: str | None) -> str:
+        dm = self.deployment_manager
+        if not dm:
+            return "Deployment manager not configured."
+        if task_id:
+            task = self._resolve_task_id(task_id)
+            if not task:
+                return f"No task found for `{task_id}`."
+            return f"*Deployment status — `{task.id[:8]}`*\n{dm.format_deployment_status(task)}"
+        lines = ["*Deployment queue*"]
+        for t in self.tasks.list_in_delivery()[:10]:
+            dep = t.metadata.get("deployment", {})
+            lines.append(
+                f"• `{t.id[:8]}` | {t.status.value} | risk={dep.get('deployment_risk', '?')}"
+            )
+        if len(lines) == 1:
+            return "No tasks in delivery pipeline."
+        return "\n".join(lines)
+
+    async def _handle_reject(self, task_id: str, reason: str, *, user_id: str | None = None) -> str:
+        from core.approval_engine import ApprovalDecision
+
+        engine = self.approval_engine
+        if not engine:
+            return "Approval engine not configured."
+
+        pending = engine.get_pending(task_id)
+        task = self._resolve_task_id(pending.task_id if pending else task_id)
+        if not task:
+            return f"No task found for `{task_id}`."
+
+        engine.apply_decision_to_task(
+            task, ApprovalDecision.REJECT, user_id=user_id, notes=reason
+        )
+        engine.clear_pending(task.id)
+        if self.approval_manager:
+            self.approval_manager.clear_approval(task.id)
+
+        task.metadata["rejection_reason"] = reason
+        self.tasks.update_status(task.id, TaskStatus.REJECTED, error=reason)
+
+        msg = f"❌ Approval rejected for task `{task.id[:8]}`: {reason}"
+        if self.slack:
+            await self.slack.notify_approval_rejected(task, reason)
+        logger.info("Task %s rejected: %s", task.id[:8], reason)
+        return msg
+
+    async def _handle_request_changes(
+        self, task_id: str, feedback: str, *, user_id: str | None = None
+    ) -> str:
+        from core.approval_engine import ApprovalDecision
+
+        engine = self.approval_engine
+        if not engine:
+            return "Approval engine not configured."
+
+        pending = engine.get_pending(task_id)
+        task = self._resolve_task_id(pending.task_id if pending else task_id)
+        if not task:
+            return f"No task found for `{task_id}`."
+
+        engine.apply_decision_to_task(
+            task, ApprovalDecision.REQUEST_CHANGES, user_id=user_id, notes=feedback
+        )
+        engine.clear_pending(task.id)
+        if self.approval_manager:
+            self.approval_manager.clear_approval(task.id)
 
         base_prompt = task.metadata.get("prompt") or task.description
         task.metadata["prompt"] = (
             f"{base_prompt}\n\n"
-            f"Previous PR was rejected. Rejection reason:\n{reason}\n"
+            f"Reviewer requested changes:\n{feedback}\n"
             f"Please address this feedback and try again."
         )
-        task.metadata["rejection_reason"] = reason
+        task.metadata["change_request_feedback"] = feedback
         task.metadata["failure_count"] = 0
+        task.metadata["approval_granted"] = True
         self.tasks.update_status(task.id, TaskStatus.PENDING, error=None)
 
-        msg = f"↩️ Task `{req.task_id[:8]}` sent back for rework: {reason}"
+        msg = f"↩️ Task `{task.id[:8]}` sent back for changes: {feedback}"
         if self.slack:
             await self.slack.notify(msg)
-        logger.info("Task %s rejected: %s", req.task_id[:8], reason)
+        logger.info("Task %s request_changes: %s", task.id[:8], feedback[:80])
         return msg
 
     async def start_task(
