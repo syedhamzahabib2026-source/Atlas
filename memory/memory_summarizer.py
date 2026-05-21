@@ -104,6 +104,12 @@ class MemorySummarizer:
         promoted = await self.lesson_extractor.maybe_promote(task, result, pid)
         insights.extend(promoted)
 
+        # Phase 11: score lessons that were injected into this task
+        injected_ids = task.metadata.get("injected_lesson_ids", [])
+        if injected_ids:
+            for lesson_id in injected_ids:
+                await self.store.update_lesson_signal(lesson_id, result.success)
+
         return insights
 
     def _distill_summary(self, task: Task, result: TaskResult) -> str:

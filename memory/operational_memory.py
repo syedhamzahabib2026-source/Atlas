@@ -298,8 +298,13 @@ class OperationalMemoryStore:
         self,
         topics: list[str] | None = None,
         limit: int = 5,
-    ) -> list[str]:
-        """Fetch cross-project lessons, optionally filtered by tag overlap."""
+        return_ids: bool = False,
+    ) -> list[str] | dict:
+        """Fetch cross-project lessons, optionally filtered by tag overlap.
+
+        With return_ids=True returns {"lessons": [...], "ids": [...]} so callers
+        can track which lessons were injected without a second query.
+        """
         rows = await self.list_memories("__global__", limit=50)
         if topics:
             def overlaps(row: dict) -> bool:
@@ -308,7 +313,31 @@ class OperationalMemoryStore:
             filtered = [r for r in rows if overlaps(r)]
             rows = filtered or rows
         rows.sort(key=lambda r: r.get("signal_score", 0), reverse=True)
-        return [r["summary"] for r in rows[:limit]]
+        top = rows[:limit]
+        if return_ids:
+            return {
+                "lessons": [r["summary"] for r in top],
+                "ids": [r["id"] for r in top],
+            }
+        return [r["summary"] for r in top]
+
+    async def update_lesson_signal(self, lesson_id: str, succeeded: bool) -> None:
+        """Nudge a global lesson's signal_score ±5 per task outcome, clamped 0–100.
+
+        Also bumps access_count so retire_weak_lessons can detect stale lessons.
+        """
+        conn = self._conn_req()
+        delta = 5 if succeeded else -5
+        conn.execute(
+            """
+            UPDATE operational_memories
+            SET signal_score = MAX(0, MIN(100, signal_score + ?)),
+                access_count = access_count + 1
+            WHERE id = ? AND project_id = '__global__'
+            """,
+            (delta, lesson_id),
+        )
+        conn.commit()
 
     async def bump_risk_zone(
         self,
@@ -470,6 +499,12 @@ class OperationalMemoryStore:
         conn.commit()
         logger.info("Pruned %d stale operational memories", deleted)
         return deleted
+
+    async def delete_memory(self, memory_id: str) -> None:
+        """Delete a single memory record by ID."""
+        conn = self._conn_req()
+        conn.execute("DELETE FROM operational_memories WHERE id = ?", (memory_id,))
+        conn.commit()
 
     async def close(self) -> None:
         if self._conn:

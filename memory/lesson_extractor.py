@@ -7,7 +7,10 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from core.logger import get_logger
 from memory.operational_memory import OperationalMemoryStore
+
+logger = get_logger("memory.lesson_extractor")
 
 if TYPE_CHECKING:
     from core.task_manager import Task
@@ -70,7 +73,28 @@ class LessonExtractor:
                         )
                         promoted.append(f"[global] {lesson}")
 
+        try:
+            await self.retire_weak_lessons()
+        except Exception:
+            pass
+
         return promoted
+
+    async def retire_weak_lessons(self) -> list[str]:
+        """Remove lessons applied 5+ times that remain below signal_score 25.
+
+        access_count is bumped by update_lesson_signal on each application,
+        so this only fires on lessons that have genuinely been tried and stayed weak.
+        """
+        rows = await self.store.list_memories("__global__", limit=200)
+        retired = []
+        for row in rows:
+            if row.get("signal_score", 50) < 25 and row.get("access_count", 0) >= 5:
+                await self.store.delete_memory(row["id"])
+                retired.append(row["id"])
+        if retired:
+            logger.info("Retired %d weak global lessons: %s", len(retired), retired)
+        return retired
 
     def _signature(self, error: str) -> str:
         """Stable short signature for an error string."""

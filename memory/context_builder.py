@@ -23,7 +23,9 @@ class ContextBuilder:
         name = project_name or task.project_id or "default"
         ctx = await self.queries.build_context(task, name)
         topics = self._infer_topics(task)
-        ctx.global_lessons = await self.store.get_global_lessons(topics, limit=3)
+        lesson_data = await self.store.get_global_lessons(topics, limit=3, return_ids=True)
+        ctx.global_lessons = lesson_data["lessons"]
+        task.metadata["injected_lesson_ids"] = lesson_data["ids"]
         logger.info(
             "Built operational context for %s: %d history, %d cautions, %d global",
             task.id[:8],
