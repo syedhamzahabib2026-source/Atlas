@@ -1,0 +1,11 @@
+# AssignMint mobile runtime defaults (macOS) — no secrets.
+# Used by --metro-demo and future mobile agents.
+
+assignmint:
+  project_root: "/Users/hamza/Desktop/Assignmint3"
+  metro_port: 8081
+  primary_simulator: "iPhone 16 Pro"
+  xcode_scheme: "Assignmint"
+  bundle_id: "com.assignmint.app"
+  ios_build_timeout_sec: 900
+  stability_wait_sec: 5
