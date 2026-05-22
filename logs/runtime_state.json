@@ -8,7 +8,14 @@
   "project_queues": {},
   "tmux_sessions_mapped": {},
   "recovery_chains_active": [],
-  "resource_usage": {},
+  "resource_usage": {
+    "total_active": 0,
+    "claude_active": 0,
+    "browser_active": 0,
+    "max_total": 3,
+    "max_claude": 2,
+    "max_browser": 2
+  },
   "integrity_issues": [
     "Previous shutdown was not graceful"
   ],
@@ -20,6 +27,6 @@
       "sessions_reconnected": 0,
       "sessions_orphaned": 0
     },
-    "saved_at": "2026-05-21T23:45:25.933516+00:00"
+    "saved_at": "2026-05-22T03:26:32.707778+00:00"
   }
 }
