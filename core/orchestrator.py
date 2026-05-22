@@ -73,7 +73,7 @@ class Orchestrator:
             config.recovery,
             log_dir=config.log_dir,
         )
-        self.git_safety = git_safety or GitSafetyCoordinator(config.git)
+        self.git_safety = git_safety or GitSafetyCoordinator(config.git, projects=config.projects)
         self._running = False
         self._cancel_events: dict[str, asyncio.Event] = {}
         self.controller = None

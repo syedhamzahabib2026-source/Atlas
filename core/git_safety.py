@@ -7,7 +7,7 @@ Keeps git logic out of agents and recovery engine execution paths.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from core.git_manager import GitManager
 from core.health_tracker import HealthTracker, HealthReport
@@ -31,21 +31,62 @@ class GitSafetyCoordinator:
         git: GitManager | None = None,
         rollback: RollbackEngine | None = None,
         health: HealthTracker | None = None,
+        projects: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.git = git or GitManager(config)
         self.rollback = rollback or RollbackEngine(config)
         self.health = health or HealthTracker(config.health_regression_threshold)
+        # Maps project_id → ProjectConfig (or any object with .repo_path).
+        # Used as the authoritative fallback when working_dir is absent or stale.
+        self.projects: dict[str, Any] = projects or {}
 
     def resolve_project_path(self, projects_dir: Path, task: Task) -> Path:
+        # 1. Prefer explicit working_dir / project_path if they exist on disk.
         for key in ("working_dir", "project_path"):
             val = task.metadata.get(key)
             if val:
                 p = Path(val).resolve()
                 if p.exists():
+                    logger.debug(
+                        "resolve_project_path: task=%s %s=%s → %s",
+                        task.id[:8], key, val, p,
+                    )
                     return p
+
+        # 2. Look up the Atlas projects config (e.g. configs/default.yaml §projects).
+        #    This is the canonical source of truth for known project repos and handles
+        #    the case where working_dir is stale (e.g. an old Windows path in the DB).
+        if task.project_id and task.project_id in self.projects:
+            proj_cfg = self.projects[task.project_id]
+            repo_path = (
+                proj_cfg.repo_path
+                if hasattr(proj_cfg, "repo_path")
+                else (proj_cfg.get("repo_path") if isinstance(proj_cfg, dict) else None)
+            )
+            if repo_path:
+                p = Path(repo_path).resolve()
+                if p.exists():
+                    logger.info(
+                        "resolve_project_path: task=%s project_id=%r → %s (from projects config)",
+                        task.id[:8], task.project_id, p,
+                    )
+                    return p
+                logger.warning(
+                    "resolve_project_path: projects config repo_path %r does not exist on disk",
+                    repo_path,
+                )
+
+        # 3. Last-resort internal fallback — creates a dir inside Atlas's own
+        #    projects/ folder; find_repo will correctly report no git repo there.
         if task.project_id:
-            return (projects_dir / task.project_id).resolve()
+            fallback = (projects_dir / task.project_id).resolve()
+            logger.warning(
+                "resolve_project_path: task=%s no valid path found for project_id=%r"
+                " — falling back to %s",
+                task.id[:8], task.project_id, fallback,
+            )
+            return fallback
         return projects_dir.resolve()
 
     async def prepare_workspace(

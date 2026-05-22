@@ -85,6 +85,7 @@ class ClaudeCodeAgent(BaseAgent):
         self._session_name: str | None = None
         self._last_output: str = ""
         self._active_tmux: TmuxManager | None = None
+        self._task_sentinel: str = ""
 
     def can_handle(self, task: Task) -> bool:
         agent = task.metadata.get("agent")
@@ -202,11 +203,20 @@ class ClaudeCodeAgent(BaseAgent):
         if not self._session_name:
             raise RuntimeError("start_session() must be called first")
 
-        text = prompt or self._build_prompt(task)
+        # Unique sentinel injected at the top of every prompt so monitor_execution
+        # can ignore stale scrollback from a previously reused session.
+        sentinel = f"ATLAS_START_{task.id[:8]}"
+        self._task_sentinel = sentinel
+        task.metadata["_sentinel"] = sentinel
+
+        base = prompt or self._build_prompt(task)
+        text = f"{sentinel}\n\n{base}"
+
         logger.info(
-            "send_prompt: session=%s chars=%d",
+            "send_prompt: session=%s chars=%d sentinel=%s",
             self._session_name,
             len(text),
+            sentinel,
         )
 
         tmux = self._active_tmux or self.tmux
@@ -275,6 +285,9 @@ class ClaudeCodeAgent(BaseAgent):
         )
 
         cancel: asyncio.Event | None = task.metadata.get("_cancel_event")
+        sentinel = task.metadata.get("_sentinel", "")
+        # sentinel_seen starts True when there is no sentinel (no filtering needed)
+        sentinel_seen = not sentinel
 
         while elapsed < max_sec:
             if cancel and cancel.is_set():
@@ -298,22 +311,43 @@ class ClaudeCodeAgent(BaseAgent):
             )
             self._last_output = output
 
+            # Wait until the sentinel appears in the pane before scanning for
+            # completion — this prevents stale scrollback from a reused session
+            # from triggering an instant false-positive.
+            if not sentinel_seen:
+                if sentinel in output:
+                    sentinel_seen = True
+                    logger.info("Sentinel seen, starting completion scan: %s", session)
+                else:
+                    await asyncio.sleep(poll)
+                    elapsed += poll
+                    continue
+
+            # Once sentinel is confirmed, only scan output from that point onward
+            # so old completion markers (from a previous task) are excluded.
+            # After the sentinel scrolls off the capture window, fall back to the
+            # full output (stale content will have scrolled away by then).
+            if sentinel and sentinel in output:
+                scan_output = output[output.index(sentinel):]
+            else:
+                scan_output = output
+
             # Stream recent tail to logs
-            tail = "\n".join(output.splitlines()[-8:])
+            tail = "\n".join(scan_output.splitlines()[-8:])
             if tail.strip():
                 logger.debug("output tail (%s):\n%s", session, tail)
 
             complete, reason = await self.detect_completion(
-                output,
+                scan_output,
                 previous_output=previous,
                 stable_count=stable_count,
             )
 
-            if output == previous:
+            if scan_output == previous:
                 stable_count += 1
             else:
                 stable_count = 0
-                previous = output
+                previous = scan_output
 
             if complete and "error_detected" not in reason:
                 result.status = ResultStatus.COMPLETED
