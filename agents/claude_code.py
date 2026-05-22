@@ -85,7 +85,6 @@ class ClaudeCodeAgent(BaseAgent):
         self._session_name: str | None = None
         self._last_output: str = ""
         self._active_tmux: TmuxManager | None = None
-        self._task_sentinel: str = ""
 
     def can_handle(self, task: Task) -> bool:
         agent = task.metadata.get("agent")

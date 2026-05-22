@@ -705,8 +705,8 @@ class Orchestrator:
             task, assessment, ApprovalPhase.PRE_EXECUTION
         )
         self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
-        await self.tasks.persist(task)
         await self.approval_engine.pause_for_approval(task, context, update_status=False)
+        await self.tasks.persist(task)
         if self.slack and self.config.slack_ready:
             await self.slack.notify_approval_waiting(task, "pre_execution")
         return False
@@ -788,8 +788,8 @@ class Orchestrator:
                 task, assessment, ApprovalPhase.PR_CREATION, result=result
             )
             self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+            await self.approval_engine.pause_for_approval(task, context, update_status=False)
             await self.tasks.persist(task)
-            await self.approval_engine.pause_for_approval(task, context)
             if self.slack and self.config.slack_ready:
                 await self.slack.notify_high_risk_detected(task, assessment.risk_level.value)
                 await self.slack.notify_approval_waiting(task, "pr_creation")
@@ -800,8 +800,8 @@ class Orchestrator:
                 task, assessment, ApprovalPhase.PR_CREATION, result=result
             )
             self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+            await self.approval_engine.pause_for_approval(task, context, update_status=False)
             await self.tasks.persist(task)
-            await self.approval_engine.pause_for_approval(task, context)
             if self.slack and self.config.slack_ready:
                 await self.slack.notify_approval_waiting(task, "post_execution")
             return
