@@ -67,10 +67,7 @@ class SlackBot:
 
         @self._app.event("message")
         async def on_message(event, say, logger):  # noqa: ARG001
-            # Thread replies to unblock tasks
             if event.get("subtype"):
-                return
-            if not event.get("thread_ts"):
                 return
             text = event.get("text", "")
             if text.strip().startswith("/atlas"):
@@ -80,7 +77,7 @@ class SlackBot:
             user_id = event.get("user")
             thread_ts = event.get("thread_ts")
 
-            allowed, msg = is_authorized(
+            allowed, _ = is_authorized(
                 self.config, user_id=user_id, channel_id=channel_id
             )
             if not allowed:
@@ -89,14 +86,26 @@ class SlackBot:
             if not self._controller:
                 return
 
-            handled = await self._controller.handle_thread_reply(
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                text=text,
-                user_id=user_id,
-            )
-            if handled:
-                logger.info("Thread reply applied for blocked task")
+            if thread_ts:
+                # Thread reply — match by Slack thread ancestry.
+                handled = await self._controller.handle_thread_reply(
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    text=text,
+                    user_id=user_id,
+                )
+                if handled:
+                    logger.info("Thread reply applied for blocked task")
+            else:
+                # Top-level message — match by task ID embedded in the text so
+                # users can unblock without knowing about threads.
+                handled = await self._controller.handle_direct_message(
+                    channel_id=channel_id,
+                    text=text,
+                    user_id=user_id,
+                )
+                if handled:
+                    logger.info("Direct message with task ID unblocked a task")
 
         @self._app.event("app_mention")
         async def on_mention(event, say, logger):  # noqa: ARG001

@@ -6,6 +6,7 @@ Phase 5: adaptive recovery states and attempt history.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -235,6 +236,29 @@ class TaskManager:
                 and task.metadata.get("slack_thread_ts") == thread_ts
             ):
                 return task
+        return None
+
+    # Matches any run of 8+ hex chars (with optional UUID dashes).
+    _HEX_TASK_ID_RE = re.compile(r'\b([0-9a-f]{8}[0-9a-f\-]*)\b', re.IGNORECASE)
+
+    def find_blocked_by_id_in_text(self, text: str) -> Task | None:
+        """
+        Scan free-form text for a hex token that is a prefix (≥8 chars) of any
+        blocked task's ID.  Lets users unblock tasks by mentioning the short ID
+        in a top-level channel message rather than having to reply in-thread.
+        """
+        bare_tokens = {
+            m.group(1).lower().replace("-", "")
+            for m in self._HEX_TASK_ID_RE.finditer(text)
+            if len(m.group(1).replace("-", "")) >= 8
+        }
+        if not bare_tokens:
+            return None
+        for task in self.list_by_status(TaskStatus.BLOCKED):
+            task_bare = task.id.lower().replace("-", "")
+            for token in bare_tokens:
+                if task_bare.startswith(token):
+                    return task
         return None
 
     def attach_result(self, task_id: str, result: TaskResult) -> Task | None:
