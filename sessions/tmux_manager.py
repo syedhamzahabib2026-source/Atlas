@@ -269,6 +269,15 @@ class TmuxManager:
         )
         return text
 
+    async def clear_history(self, session_name: str) -> bool:
+        """Erase tmux scrollback for session_name so stale output can't pollute detection."""
+        result = await self._run(["clear-history", "-t", session_name])
+        if result.returncode == 0:
+            logger.debug("Cleared tmux history: %s", session_name)
+            return True
+        logger.warning("clear_history failed for %s: %s", session_name, result.stderr.strip())
+        return False
+
     async def kill_session(self, session_name: str) -> bool:
         """Kill a tmux session."""
         if not await self.session_exists(session_name):
