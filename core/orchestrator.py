@@ -845,8 +845,8 @@ class Orchestrator:
             context.pr_number = prep.candidate.pr_number
 
         self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+        await self.approval_engine.pause_for_approval(task, context, update_status=False)
         await self.tasks.persist(task)
-        await self.approval_engine.pause_for_approval(task, context)
 
         if self.slack and self.config.slack_ready:
             await self.slack.notify_pr_candidate_prepared(task, prep.candidate)

@@ -463,9 +463,17 @@ class ApprovalEngine:
                 continue
             ctx_data = task.metadata.get("approval_context")
             if not ctx_data:
+                logger.warning(
+                    "rehydrate: task %s is waiting_approval but has no approval_context — skipping",
+                    task.id[:8],
+                )
                 continue
             risk = RiskAssessment.from_dict(ctx_data.get("risk"))
             if not risk:
+                logger.warning(
+                    "rehydrate: task %s approval_context has no risk data — skipping",
+                    task.id[:8],
+                )
                 continue
             try:
                 phase = ApprovalPhase(ctx_data.get("phase", "post_execution"))
@@ -491,6 +499,11 @@ class ApprovalEngine:
                 branch_name=context.branch_name,
                 pr_url=context.pr_url,
                 pr_number=context.pr_number,
+            )
+            logger.info(
+                "rehydrate: restored pending approval for task %s (phase=%s)",
+                task.id[:8],
+                context.phase.value,
             )
 
     def format_slack_message(self, task: Task, context: ApprovalContext) -> str:
