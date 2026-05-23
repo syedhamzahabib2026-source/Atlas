@@ -132,7 +132,13 @@ class ClaudeCodeAgent(BaseAgent):
         return fallback.resolve()
 
     def _build_prompt(self, task: Task) -> str:
-        parts: list[str] = []
+        parts: list[str] = [
+            "You are in autonomous execution mode. Do not explain your plan. "
+            "Do not ask questions. Do not summarize what you are about to do. "
+            "Immediately open the files and make the required changes. "
+            "Start editing now. When done, run git add -A && git commit -m 'atlas: <description>'. "
+            "Do not stop until the files are edited and committed."
+        ]
         if ctx := task.metadata.get("operational_context"):
             parts.append(str(ctx))
         if custom := task.metadata.get("prompt"):
