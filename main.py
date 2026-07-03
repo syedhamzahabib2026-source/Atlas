@@ -66,6 +66,7 @@ def _claude_agent_config(app_config) -> ClaudeCodeConfig:
         idle_stable_polls=c.idle_stable_polls,
         capture_lines=c.capture_lines,
         kill_session_on_finish=c.kill_session_on_finish,
+        kill_session_on_success=c.kill_session_on_success,
     )
 
 

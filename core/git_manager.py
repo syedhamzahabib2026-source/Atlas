@@ -247,6 +247,52 @@ class GitManager:
             logger.exception("Revert failed for %s", commit_hash[:8])
             return False
 
+    async def commit_all(self, repo_path: Path, message: str) -> str | None:
+        """Stage and commit everything. Returns commit hash or None if clean."""
+
+        def _commit():
+            repo = self._repo(repo_path)
+            if not repo.is_dirty(untracked_files=True):
+                return None
+            repo.git.add("--all")
+            try:
+                commit = repo.index.commit(message)
+            except Exception as exc:
+                if "nothing to commit" in str(exc).lower():
+                    return None
+                raise
+            logger.info("Committed all changes: %s", commit.hexsha[:8])
+            return commit.hexsha
+
+        return await self._run(_commit)
+
+    async def count_commits_ahead(
+        self,
+        repo_path: Path,
+        base_branch: str,
+    ) -> int | None:
+        """
+        Commits on HEAD not on base_branch. Returns None when the count
+        cannot be determined (missing base ref, git error) so callers can
+        distinguish "zero commits" from "unknown".
+        """
+
+        def _count():
+            repo = self._repo(repo_path)
+            for ref in (base_branch, f"origin/{base_branch}"):
+                try:
+                    out = repo.git.rev_list("--count", f"{ref}..HEAD")
+                    return int(out.strip() or 0)
+                except Exception:
+                    continue
+            return None
+
+        try:
+            return await self._run(_count)
+        except Exception:
+            logger.exception("count_commits_ahead failed for %s", repo_path)
+            return None
+
     async def diff_stat(self, repo_path: Path, ref_a: str = "HEAD~1", ref_b: str = "HEAD") -> str:
         def _diff():
             repo = self._repo(repo_path)

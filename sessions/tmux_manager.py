@@ -144,10 +144,21 @@ class TmuxManager:
     async def list_sessions(self) -> list[str]:
         if not self.is_available():
             return []
-        result = await self._run(["list-sessions", "-F", "#{session_name}"])
+        # Do NOT use list-sessions -F "#{session_name}" on WSL: the # is stripped
+        # by wsl.exe argument parsing, leaving -F with no value (rc=1, no server).
+        result = await self._run(["list-sessions"])
         if result.returncode != 0:
             return []
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        names: list[str] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            # Default format: "session-name: N windows (created ...)"
+            name = line.split(":", 1)[0].strip()
+            if name:
+                names.append(name)
+        return names
 
     async def session_exists(self, session_name: str) -> bool:
         """Return True if a tmux session with this name exists."""

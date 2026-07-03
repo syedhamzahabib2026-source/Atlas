@@ -279,6 +279,13 @@ projects:
   assignmint:
     repo_path: "C:/Users/shamz/Desktop/Assignmint"
     description: "AssignMint web app"
+    # Optional V1 fields:
+    test_command: "npm test"          # quality gate after implementation
+    build_command: "npm run build"    # quality gate after implementation
+    check_timeout_sec: 600            # hard cap per gate command
+    verify_url: "http://localhost:3000"  # default browser smoke verify
+    github_owner: "acme"              # per-project PR target
+    github_repo: "assignmint"         # (token stays in GITHUB_TOKEN env)
   myproject:
     repo_path: "C:/Users/shamz/Desktop/MyProject"
     description: "..."
@@ -289,6 +296,50 @@ Then from Slack: `/atlas start --project myproject <prompt>`
 This injects `working_dir` into task metadata, which flows through to:
 1. `git_safety.resolve_project_path()` → creates git branch in the correct repo
 2. `agents/claude_code._resolve_working_dir()` → tmux session opens in the correct dir
+
+---
+
+## V1 Hardening (Execution Correctness + Verification)
+
+Implemented after the production-readiness audit. Key behavior changes:
+
+**Sessions are per-task, never reused.** Session names include the task id
+(`atlas-<project>-<taskid8>`, retries get `-r<n>`). `start_session` kills any
+leftover session with the same name before creating a fresh one. On success
+the session is killed (`kill_session_on_success: true`); failed sessions stay
+alive for post-mortem. `task.metadata["session_name"]` is a *record* of the
+last session — only `custom_session_name` forces a specific name.
+
+**Completion detection is sentinel-driven.** Every prompt instructs Claude to
+print `ATLAS_TASK_COMPLETE` or `ATLAS_TASK_FAILED: <reason>` as its final
+line (described in split form in the prompt so the echo can't trigger
+detection). Detection priority: sentinel > fatal CLI markers (rate limit,
+command not found) > idle-at-prompt > stable output. Weak word markers
+("done", "✓") were removed; code-level errors mid-run no longer fail tasks.
+
+**Success requires evidence.** `_verify_success_evidence` (orchestrator) runs
+before any success is finalized: uncommitted work is auto-committed, then the
+task branch must have ≥1 commit vs its base branch or the task is routed to
+recovery with `no_code_changes_detected`. Opt out per task with metadata
+`require_commit: false`.
+
+**Quality gates.** If the project config defines `test_command` /
+`build_command`, they run in the repo after implementation; non-zero exit or
+timeout routes the task to recovery with the gate output attached.
+
+**Worker pool slots are released on every exit path**, including the
+pre-execution approval pause and preparation errors (`_release_worker_pool`).
+
+**PR flow.** `has_commits_ahead` uses the task's real base branch (falls back
+origin/<base> → <base>). Per-project GitHub targets via `github_owner` /
+`github_repo`. Low-risk tasks with verified evidence (passed quality gates or
+browser verify) auto-merge when `approval.auto_approve_low_risk` is on;
+everything else still waits for a human.
+
+**Tasks persist immediately** when created from Slack (`start_task`), so a
+crash before the first orchestrator tick cannot lose work.
+
+Tests live in `tests/` (`python -m pytest tests`).
 
 ---
 

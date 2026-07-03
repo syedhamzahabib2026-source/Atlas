@@ -7,12 +7,16 @@ Phase 8: durable runtime, task persistence, recovery on restart.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from core.blocked import detect_block
 from core.config import AtlasConfig
 from core.git_safety import GitSafetyCoordinator
 from core.logger import get_logger
+from core.pr_manager import GitHubConfig, PRManager, PRPreparationManager
 from core.recovery_engine import RecoveryAction, RecoveryEngine
 from core.recovery_strategies import RecoveryStrategy
 from core.task_manager import TaskManager, TaskStatus
@@ -23,7 +27,6 @@ if TYPE_CHECKING:
     from core.approval_engine import ApprovalEngine
     from core.approval_manager import ApprovalManager
     from core.deployment_manager import DeploymentManager
-    from core.pr_manager import PRManager, PRPreparationManager
     from core.runtime_manager import RuntimeManager
     from core.task_store import TaskStore
     from core.worker_pool_manager import WorkerPoolManager
@@ -82,6 +85,8 @@ class Orchestrator:
         self.pr_manager: PRManager | None = None
         self.pr_preparation: PRPreparationManager | None = None
         self.deployment_manager: DeploymentManager | None = None
+        # Per-project GitHub clients keyed by (owner, repo) — Tier 3.1
+        self._pr_managers: dict[tuple[str, str], PRManager] = {}
 
     def request_cancel(self, task_id: str) -> None:
         event = self._cancel_events.get(task_id)
@@ -255,10 +260,28 @@ class Orchestrator:
             return
 
         if not await self._check_pre_execution_approval(task):
+            # Slot was acquired during routing — release it or the pool
+            # leaks capacity every time a task pauses at the approval gate.
+            self._release_worker_pool(task)
             return
 
-        await self._prepare_git_workspace(task)
-        await self._prepare_operational_context(task)
+        try:
+            await self._prepare_git_workspace(task)
+            await self._prepare_operational_context(task)
+        except Exception as exc:
+            logger.exception("Task preparation failed: %s", task.id[:8])
+            self._release_worker_pool(task)
+            prep_result = TaskResult(
+                status=ResultStatus.FAILED,
+                summary=f"Preparation error: {exc}",
+                session_name=task.session_name or "",
+                errors=[str(exc)],
+                metadata={"task_id": task.id},
+            )
+            prep_result.finish()
+            self.tasks.attach_result(task.id, prep_result)
+            await self._handle_failure_with_recovery(task, prep_result, phase="preparation")
+            return
 
         self.tasks.update_status(task.id, TaskStatus.RUNNING)
         await self.tasks.persist(task)
@@ -298,6 +321,15 @@ class Orchestrator:
             return
 
         if result.success:
+            # Tier 1.3: success requires evidence (committed work), not just
+            # an idle-looking tmux pane.
+            if not await self._verify_success_evidence(task, result):
+                await self._handle_failure_with_recovery(task, result, phase="execution")
+                return
+            # Tier 2.2: project quality gates (build/test) must pass.
+            if not await self._run_quality_gates(task, result):
+                await self._handle_failure_with_recovery(task, result, phase="verification")
+                return
             verify = await self._maybe_verify(task, result)
             if verify is not None:
                 return
@@ -356,6 +388,11 @@ class Orchestrator:
 
         return True
 
+    def _release_worker_pool(self, task) -> None:
+        """Idempotent slot release for exit paths that skip result recording."""
+        if self.worker_pools and self.worker_pools.enabled:
+            self.worker_pools.release_task(task)
+
     async def _record_pool_result(self, task, result: TaskResult) -> None:
         if not self.worker_pools or not self.worker_pools.enabled:
             return
@@ -394,6 +431,159 @@ class Orchestrator:
                 cps = git_meta.get("checkpoints", [])
                 if cps:
                     await self.slack.notify_checkpoint_created(task, cps[-1])
+
+    async def _verify_success_evidence(self, task, result: TaskResult) -> bool:
+        """
+        Success gate (Tier 1.3): a git-isolated coding task only counts as
+        successful when committed work exists on the task branch.
+
+        Mutates `result` to FAILED with a diagnostic when evidence is missing.
+        Tasks may opt out with metadata require_commit: false (e.g. analysis
+        prompts that intentionally change nothing).
+        """
+        if task.metadata.get("agent") == "browser":
+            return True
+        if task.metadata.get("require_commit") is False:
+            return True
+
+        git_meta = task.metadata.get("git") or {}
+        repo_path = git_meta.get("repo_path")
+        if not repo_path or not self.git_safety.git.is_available():
+            return True  # no git isolation — nothing to check against
+
+        repo = Path(repo_path)
+
+        # Rescue uncommitted work first: Claude finishing without committing
+        # was a recurring production bug (empty-diff PRs).
+        try:
+            if await self.git_safety.git.is_dirty(repo):
+                sha = await self.git_safety.git.commit_all(
+                    repo, f"atlas: auto-commit task work (task={task.id[:8]})"
+                )
+                if sha:
+                    git_meta["auto_committed"] = sha
+                    logger.info(
+                        "Auto-committed uncommitted work for %s: %s",
+                        task.id[:8],
+                        sha[:8],
+                    )
+        except Exception:
+            logger.exception("Auto-commit failed for %s", task.id[:8])
+
+        base = git_meta.get("base_branch") or "main"
+        count = await self.git_safety.git.count_commits_ahead(repo, base)
+        if count is None:
+            # Can't determine — don't fail a possibly-good run on a git
+            # plumbing error; PR-time empty-diff check still applies.
+            logger.warning(
+                "Could not count commits ahead of %s for %s — gate skipped",
+                base,
+                task.id[:8],
+            )
+            return True
+
+        git_meta["commits_ahead"] = count
+        if count > 0:
+            return True
+
+        result.status = ResultStatus.FAILED
+        result.errors.append("no_code_changes_detected")
+        result.summary = (
+            "Agent reported completion but no commits exist on the task "
+            f"branch vs {base}. The requested work was not delivered."
+        )
+        logger.error("Success gate failed for %s: no commits on branch", task.id[:8])
+        return False
+
+    def _project_config_for(self, task):
+        if not task.project_id:
+            return None
+        return self.config.projects.get(task.project_id)
+
+    async def _run_quality_gates(self, task, result: TaskResult) -> bool:
+        """
+        Tier 2.2: run the project's build/test commands after implementation.
+
+        Returns False (and mutates `result` to FAILED) when a gate fails so
+        the standard recovery path handles it. Projects without configured
+        commands pass trivially.
+        """
+        if task.metadata.get("agent") == "browser":
+            return True
+        proj = self._project_config_for(task)
+        if not proj:
+            return True
+
+        commands = [
+            ("build", proj.build_command),
+            ("test", proj.test_command),
+        ]
+        commands = [(name, cmd) for name, cmd in commands if cmd.strip()]
+        if not commands:
+            return True
+
+        cwd = (
+            (task.metadata.get("git") or {}).get("repo_path")
+            or task.metadata.get("working_dir")
+            or proj.repo_path
+        )
+        gates: dict[str, str] = {}
+        task.metadata["quality_gates"] = gates
+
+        for name, cmd in commands:
+            logger.info("Quality gate %r for %s: %s", name, task.id[:8], cmd)
+
+            def _run_cmd(command=cmd):
+                return subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=proj.check_timeout_sec,
+                )
+
+            try:
+                proc = await asyncio.to_thread(_run_cmd)
+            except subprocess.TimeoutExpired:
+                gates[name] = "timeout"
+                result.status = ResultStatus.FAILED
+                result.errors.append(f"{name}_gate_timeout")
+                result.summary = (
+                    f"Quality gate '{name}' timed out after "
+                    f"{proj.check_timeout_sec}s: {cmd}"
+                )
+                return False
+            except Exception as exc:
+                gates[name] = "error"
+                logger.exception("Quality gate %r crashed for %s", name, task.id[:8])
+                result.status = ResultStatus.FAILED
+                result.errors.append(f"{name}_gate_error")
+                result.summary = f"Quality gate '{name}' could not run: {exc}"
+                return False
+
+            if proc.returncode != 0:
+                tail = ((proc.stdout or "") + "\n" + (proc.stderr or ""))[-3000:]
+                gates[name] = "failed"
+                task.metadata[f"quality_gate_{name}_output"] = tail
+                result.status = ResultStatus.FAILED
+                result.errors.append(f"{name}_gate_failed")
+                result.summary = (
+                    f"Quality gate '{name}' failed (exit {proc.returncode}): {cmd}"
+                )
+                result.raw_output = (result.raw_output or "") + f"\n\n[{name} gate output]\n{tail}"
+                logger.error(
+                    "Quality gate %r failed for %s (exit %s)",
+                    name,
+                    task.id[:8],
+                    proc.returncode,
+                )
+                return False
+
+            gates[name] = "passed"
+            logger.info("Quality gate %r passed for %s", name, task.id[:8])
+
+        return True
 
     async def _maybe_verify(self, task, code_result: TaskResult) -> bool | None:
         verify_cfg = task.metadata.get("verify") or task.metadata.get("verification")
@@ -741,10 +931,45 @@ class Orchestrator:
             else:
                 await self.slack.notify_task_completed(task, result)
 
+    def pr_manager_for(self, task) -> PRManager | None:
+        """
+        Per-project GitHub client (Tier 3.1). Falls back to the env-configured
+        default when the project has no explicit github_owner/github_repo.
+        Token always comes from GITHUB_TOKEN in the environment.
+        """
+        proj = self._project_config_for(task)
+        if not proj or not proj.github_owner or not proj.github_repo:
+            return self.pr_manager
+
+        key = (proj.github_owner, proj.github_repo)
+        cached = self._pr_managers.get(key)
+        if cached:
+            return cached
+
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            logger.warning(
+                "Project %s has GitHub config but GITHUB_TOKEN is not set",
+                task.project_id,
+            )
+            return self.pr_manager
+
+        client = PRManager(GitHubConfig(token=token, owner=key[0], repo=key[1]))
+        self._pr_managers[key] = client
+        logger.info("GitHub client ready for %s/%s", key[0], key[1])
+        return client
+
+    def _pr_preparation_for(self, task) -> PRPreparationManager | None:
+        github = self.pr_manager_for(task)
+        if github is self.pr_manager:
+            return self.pr_preparation
+        return PRPreparationManager(github)
+
     async def _prepare_pr_with_approval_gate(self, task, branch: str, result: TaskResult) -> None:
-        """branch → checkpoint → modify → verify → summarize → approval → PR prep (no auto-merge)."""
+        """branch → checkpoint → modify → verify → summarize → approval → PR prep."""
         from core.approval_engine import ApprovalPhase
 
+        pr_preparation = self._pr_preparation_for(task) or self.pr_preparation
         git_meta = task.metadata.get("git", {})
         repo_path = git_meta.get("repo_path")
         assessment = self.approval_engine.classify(
@@ -763,7 +988,7 @@ class Orchestrator:
             f"**Task:** `{task.id[:8]}`\n"
             f"**Prompt:** {(task.metadata.get('prompt') or task.description)[:500]}"
         )
-        candidate = self.pr_preparation.build_candidate(
+        candidate = pr_preparation.build_candidate(
             task.id,
             branch,
             repo_path=str(repo_path) if repo_path else None,
@@ -773,7 +998,7 @@ class Orchestrator:
             risk_level=assessment.risk_level.value,
             git_meta=git_meta,
         )
-        candidate.body = self.pr_preparation.enrich_pr_body(
+        candidate.body = pr_preparation.enrich_pr_body(
             candidate,
             {
                 "change_summary": task.metadata.get("change_summary", ""),
@@ -806,12 +1031,15 @@ class Orchestrator:
                 await self.slack.notify_approval_waiting(task, "post_execution")
             return
 
+        base_branch = git_meta.get("base_branch") or "main"
         if repo_path:
-            has_commits = await self.pr_preparation.has_commits_ahead(str(repo_path))
+            has_commits = await pr_preparation.has_commits_ahead(
+                str(repo_path), base=base_branch
+            )
             if not has_commits:
                 msg = (
                     f"✅ Task `{task.id[:8]}` complete — no code changes to merge, "
-                    f"branch is identical to main."
+                    f"branch is identical to {base_branch}."
                 )
                 logger.info("Task %s has no new commits — skipping PR", task.id[:8])
                 self.tasks.update_status(task.id, TaskStatus.COMPLETED)
@@ -820,7 +1048,7 @@ class Orchestrator:
                     await self.slack.notify(msg)
                 return
 
-        prep = await self.pr_preparation.prepare_pr(candidate, push=bool(repo_path), create=True)
+        prep = await pr_preparation.prepare_pr(candidate, push=bool(repo_path), create=True)
         if not prep.success:
             logger.error("PR preparation failed for %s: %s", task.id[:8], prep.error)
             if self.slack and self.config.slack_ready:
@@ -836,6 +1064,9 @@ class Orchestrator:
             task.metadata["pr_number"] = prep.candidate.pr_number
             task.metadata["pr_url"] = prep.candidate.pr_url
             task.metadata["pr_candidate"] = prep.candidate.to_dict()
+
+        if await self._maybe_auto_merge(task, assessment, prep):
+            return
 
         context = self.approval_engine.build_approval_context(
             task, assessment, ApprovalPhase.PR_CREATION, result=result
@@ -857,6 +1088,74 @@ class Orchestrator:
             task.id[:8],
             prep.candidate.pr_number if prep.candidate else "?",
         )
+
+    def _has_verified_evidence(self, task) -> bool:
+        """True when at least one real verification signal passed (Tier 3.2)."""
+        gates = task.metadata.get("quality_gates") or {}
+        if gates and all(v == "passed" for v in gates.values()):
+            return True
+        verification = task.metadata.get("verification") or {}
+        return verification.get("status") == "passed"
+
+    async def _maybe_auto_merge(self, task, assessment, prep) -> bool:
+        """
+        Auto-merge low-risk verified work (Tier 3.2).
+
+        Requires ALL of: approvals enabled with auto_approve_low_risk, LOW
+        risk with allow_auto_pr policy, a created PR, and at least one passed
+        verification signal (quality gate or browser verify). Anything else
+        waits for a human. Returns True when the task was merged and closed.
+        """
+        if not self.config.approval.enabled:
+            return False
+        if not self.config.approval.auto_approve_low_risk:
+            return False
+        if assessment.risk_level.value != "low":
+            return False
+        if not prep.candidate or not prep.candidate.pr_number:
+            return False
+        if not self._has_verified_evidence(task):
+            logger.info(
+                "Task %s is low-risk but has no verified evidence — "
+                "keeping human approval gate",
+                task.id[:8],
+            )
+            return False
+
+        requirement = self.approval_engine.policy.requirement_for(
+            assessment.risk_level
+        )
+        if not requirement.allow_auto_pr:
+            return False
+
+        pr_number = prep.candidate.pr_number
+        github = self.pr_manager_for(task)
+        if not github:
+            return False
+
+        merge = await github.merge_pr(pr_number)
+        if not merge.success or not merge.merged:
+            logger.warning(
+                "Auto-merge failed for %s (PR #%s): %s — waiting for human",
+                task.id[:8],
+                pr_number,
+                merge.error or merge.message,
+            )
+            return False
+
+        task.metadata["auto_merged"] = True
+        self.tasks.update_status(task.id, TaskStatus.MERGED)
+        await self.tasks.persist(task)
+        logger.info("Auto-merged PR #%s for low-risk task %s", pr_number, task.id[:8])
+
+        if self.slack and self.config.slack_ready:
+            await self.slack.notify(
+                f"✅ PR #{pr_number} auto-merged (low risk, verified) — "
+                f"task `{task.id[:8]}` complete.\n{prep.candidate.pr_url or ''}"
+            )
+
+        await self.start_delivery_for_task(task)
+        return True
 
     async def _finalize_failure(
         self, task, result: TaskResult, *, notify_slack: bool = True

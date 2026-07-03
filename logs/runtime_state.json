@@ -1,6 +1,6 @@
 {
-  "atlas_pid": 7452,
-  "started_at": "2026-05-21T05:02:38.698254+00:00",
+  "atlas_pid": 24908,
+  "started_at": "2026-07-03T23:07:57.853409+00:00",
   "last_shutdown_at": null,
   "last_shutdown_graceful": false,
   "orchestrator_running": true,
@@ -8,25 +8,18 @@
   "project_queues": {},
   "tmux_sessions_mapped": {},
   "recovery_chains_active": [],
-  "resource_usage": {
-    "total_active": 0,
-    "claude_active": 0,
-    "browser_active": 0,
-    "max_total": 3,
-    "max_claude": 2,
-    "max_browser": 2
-  },
+  "resource_usage": {},
   "integrity_issues": [
     "Previous shutdown was not graceful"
   ],
-  "boot_count": 6,
+  "boot_count": 9,
   "metadata": {
     "recovery_report": {
-      "tasks_restored": 12,
+      "tasks_restored": 14,
       "tasks_normalized": 0,
       "sessions_reconnected": 0,
-      "sessions_orphaned": 0
+      "sessions_orphaned": 1
     },
-    "saved_at": "2026-05-21T05:33:05.945621+00:00"
+    "saved_at": "2026-07-03T23:07:58.366458+00:00"
   }
 }

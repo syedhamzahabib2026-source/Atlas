@@ -35,28 +35,37 @@ class ClaudeCodeConfig:
     idle_stable_polls: int = 3
     capture_lines: int = 200
     kill_session_on_finish: bool = False
+    kill_session_on_success: bool = True
 
 
-# Heuristic signals — practical, not perfect
-_COMPLETION_MARKERS = (
-    "done",
-    "completed",
-    "finished",
-    "task complete",
-    "all done",
-    "✓",
-    "✔",
-)
+# Structured completion sentinels — instructed in every prompt (Tier 1.4).
+# These are the primary, high-confidence completion signal.
+SENTINEL_COMPLETE = "ATLAS_TASK_COMPLETE"
+SENTINEL_FAILED = "ATLAS_TASK_FAILED"
 
-_ERROR_MARKERS = (
-    "error:",
-    "traceback (most recent call last)",
+# Fatal markers that justify failing immediately even mid-run: they indicate
+# the CLI itself cannot proceed (launch/auth problems), not code-level errors
+# Claude may be in the middle of fixing.
+_FATAL_MARKERS = (
     "command not found",
     "enoent",
-    "permission denied",
     "api error",
     "rate limit",
+    "usage limit",
+    "quota exceeded",
 )
+
+# Soft error markers — only consulted when the session has gone idle, to
+# classify how the run ended. Never fail mid-run on these: Claude routinely
+# prints and then fixes errors during normal work.
+_IDLE_ERROR_MARKERS = (
+    "traceback (most recent call last)",
+    "permission denied",
+)
+
+# How many trailing lines to scan for markers (avoids matching scrollback
+# from earlier in the session or echoes of the injected prompt).
+_MARKER_TAIL_LINES = 25
 
 # Claude Code often shows an input prompt when idle (varies by version)
 _IDLE_PROMPT_PATTERNS = (
@@ -102,10 +111,22 @@ class ClaudeCodeAgent(BaseAgent):
         return self.tmux
 
     def _resolve_session_name(self, task: Task) -> str:
-        custom = task.metadata.get("session_name")
+        # Explicit operator override only. task.metadata["session_name"] is a
+        # *record* of the last session, deliberately NOT honored here: reusing
+        # a failed attempt's session re-enters broken CLI state (bug H2).
+        custom = task.metadata.get("custom_session_name")
         if custom:
             return str(custom)
-        key = task.project_id or task.id[:12]
+        # Session-per-task (Tier 1.2): include task id so concurrent tasks on
+        # the same project never share a Claude session. Retries get a fresh
+        # suffix so they never inherit a failed session's broken CLI state.
+        if task.project_id:
+            key = f"{task.project_id[:24]}-{task.id[:8]}"
+        else:
+            key = task.id[:12]
+        attempt = int(task.metadata.get("recovery_attempt_count", 0))
+        if attempt > 0:
+            key = f"{key}-r{attempt}"
         return self._tmux_for(task).session_name(key)
 
     def _launch_command(self, task: Task) -> str:
@@ -141,10 +162,21 @@ class ClaudeCodeAgent(BaseAgent):
             parts.append(task.title)
             if task.description:
                 parts.append(task.description)
+        # NOTE: the sentinel is described in two pieces so the literal marker
+        # never appears in the prompt echo inside the tmux pane — otherwise
+        # detection would fire on our own instructions.
         parts.append(
-            "\n\nIMPORTANT: After completing all changes, you MUST run:\n"
-            "git add -A && git commit -m 'atlas: <describe what you did>'\n"
-            "Do not finish without committing."
+            "\n\nIMPORTANT completion protocol:\n"
+            "1. After completing all changes, you MUST run:\n"
+            "   git add -A && git commit -m 'atlas: <describe what you did>'\n"
+            "   Do not finish without committing.\n"
+            "2. When everything is finished and committed, print one final line\n"
+            "   consisting of the word ATLAS_TASK_ immediately followed by the\n"
+            "   word COMPLETE (joined together as a single token, no space).\n"
+            "3. If you cannot complete the task, print one final line consisting\n"
+            "   of ATLAS_TASK_ immediately followed by FAILED (single token),\n"
+            "   then a colon and a one-line reason.\n"
+            "Print that marker line alone as your very last output."
         )
         return "\n\n".join(parts)
 
@@ -173,6 +205,15 @@ class ClaudeCodeAgent(BaseAgent):
             task.id[:8],
         )
 
+        # Never reuse a leftover session (Tier 1.5 / bug H2): stale Claude
+        # CLI state caused instant error loops. Kill and start clean.
+        if await tmux.session_exists(self._session_name):
+            logger.warning(
+                "Killing leftover tmux session before fresh start: %s",
+                self._session_name,
+            )
+            await tmux.kill_session(self._session_name)
+
         created = await tmux.create_session(
             self._session_name,
             working_dir=working_dir,
@@ -181,19 +222,11 @@ class ClaudeCodeAgent(BaseAgent):
             raise RuntimeError(f"Failed to create tmux session: {self._session_name}")
 
         launch_cmd = self._launch_command(task)
-        # Launch Claude Code if pane does not already show it
-        snapshot = await tmux.capture_output(
-            self._session_name,
-            lines=30,
-        )
-        if self.config.command.lower() not in snapshot.lower():
-            logger.info("Launching %s in %s", launch_cmd, self._session_name)
-            ok = await tmux.send_keys(self._session_name, launch_cmd)
-            if not ok:
-                raise RuntimeError(f"Failed to launch {self.config.command}")
-            await asyncio.sleep(self.config.launch_wait_sec)
-        else:
-            logger.info("Claude Code already running in %s", self._session_name)
+        logger.info("Launching %s in %s", launch_cmd, self._session_name)
+        ok = await tmux.send_keys(self._session_name, launch_cmd)
+        if not ok:
+            raise RuntimeError(f"Failed to launch {self.config.command}")
+        await asyncio.sleep(self.config.launch_wait_sec)
 
         return self._session_name
 
@@ -214,6 +247,10 @@ class ClaudeCodeAgent(BaseAgent):
         if not ok:
             raise RuntimeError("Failed to send prompt to tmux session")
 
+    @staticmethod
+    def _tail(output: str, lines: int = _MARKER_TAIL_LINES) -> str:
+        return "\n".join(output.splitlines()[-lines:])
+
     async def detect_completion(
         self,
         output: str,
@@ -222,27 +259,52 @@ class ClaudeCodeAgent(BaseAgent):
         stable_count: int,
     ) -> tuple[bool, str]:
         """
-        Simple completion heuristics.
+        Completion detection, in priority order (Tier 1.4):
+
+        1. Structured sentinels printed by Claude (high confidence)
+        2. Fatal CLI markers in the tail (launch/auth failures)
+        3. Idle-at-prompt with stable output — classified by tail errors
+        4. Output stable fallback
+
+        Weak word markers ("done", "completed", checkmarks) were removed:
+        they matched Claude's conversational output and caused false success.
 
         Returns (is_complete, reason).
         """
-        lower = output.lower()
+        tail = self._tail(output)
+        tail_lower = tail.lower()
 
-        for marker in _ERROR_MARKERS:
-            if marker in lower:
-                return False, f"error_detected:{marker}"
+        # 1. Structured sentinels — primary signal
+        if SENTINEL_FAILED in tail:
+            return True, f"sentinel_failed:{SENTINEL_FAILED}"
+        if SENTINEL_COMPLETE in tail:
+            return True, f"sentinel_complete:{SENTINEL_COMPLETE}"
 
-        for marker in _COMPLETION_MARKERS:
-            if marker in lower:
-                return True, f"marker:{marker}"
+        # 2. Fatal markers — CLI cannot proceed regardless of Claude's state
+        for marker in _FATAL_MARKERS:
+            if marker in tail_lower:
+                return True, f"error_detected:{marker}"
 
+        is_stable = (
+            output == previous_output
+            and stable_count >= self.config.idle_stable_polls
+        )
+
+        # 3. Idle prompt visible + output stopped changing
         for pattern in _IDLE_PROMPT_PATTERNS:
             if pattern.search(output):
-                # Prompt visible and output stopped changing
-                if output == previous_output and stable_count >= self.config.idle_stable_polls:
+                if is_stable:
+                    for marker in _IDLE_ERROR_MARKERS:
+                        if marker in tail_lower:
+                            return True, f"error_detected:{marker}"
                     return True, "idle_at_prompt"
+                break
 
-        if output == previous_output and stable_count >= self.config.idle_stable_polls:
+        # 4. Output frozen without a recognizable prompt
+        if is_stable:
+            for marker in _IDLE_ERROR_MARKERS:
+                if marker in tail_lower:
+                    return True, f"error_detected:{marker}"
             return True, "output_stable"
 
         return False, "running"
@@ -315,19 +377,18 @@ class ClaudeCodeAgent(BaseAgent):
                 stable_count = 0
                 previous = output
 
-            if complete and "error_detected" not in reason:
-                result.status = ResultStatus.COMPLETED
-                result.summary = f"Detected completion ({reason})"
+            if complete:
+                failed = reason.startswith(("error_detected", "sentinel_failed"))
                 result.raw_output = output
-                logger.info("Completion detected: %s (%s)", session, reason)
-                break
-
-            if "error_detected" in reason:
-                result.status = ResultStatus.FAILED
-                result.summary = f"Execution failed ({reason})"
-                result.raw_output = output
-                result.errors.append(reason)
-                logger.error("Failure detected: %s (%s)", session, reason)
+                if failed:
+                    result.status = ResultStatus.FAILED
+                    result.summary = f"Execution failed ({reason})"
+                    result.errors.append(reason)
+                    logger.error("Failure detected: %s (%s)", session, reason)
+                else:
+                    result.status = ResultStatus.COMPLETED
+                    result.summary = f"Detected completion ({reason})"
+                    logger.info("Completion detected: %s (%s)", session, reason)
                 break
 
             await asyncio.sleep(poll)
@@ -353,13 +414,18 @@ class ClaudeCodeAgent(BaseAgent):
             result.metadata["task_id"] = task.id
             result.metadata["agent"] = self.name
 
-            # TODO: Slack — notify on completion / failure
-            # TODO: memory.store — persist result.raw_output + summary
-            # TODO: retries — if result.status == TIMEOUT, re-queue with metadata
-
-            if self.config.kill_session_on_finish:
+            # Session lifecycle (Tier 1.5): kill on success so retries and new
+            # tasks always start clean; keep failed sessions for post-mortem
+            # unless kill_session_on_finish forces cleanup for all outcomes.
+            should_kill = self.config.kill_session_on_finish or (
+                result.status == ResultStatus.COMPLETED
+                and self.config.kill_session_on_success
+            )
+            if should_kill:
                 tmux = self._active_tmux or self.tmux
                 await tmux.kill_session(session)
+                # Clear stale session pointer so retries build a fresh session
+                task.metadata.pop("session_name", None)
 
             return result
 

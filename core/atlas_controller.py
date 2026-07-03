@@ -191,6 +191,9 @@ class AtlasController:
             "• `/atlas approve_deploy <task_id>` — approve production deployment\n"
             "• `/atlas rollback_release <task_id> <reason>` — rollback release\n"
             "• `/atlas deployment_status [task_id]` — delivery / CI status\n"
+            "\n_Use `/atlas …` (slash command), not plain chat._ "
+            "In a channel, invite @Atlas first. "
+            "Plain-text DMs need *Messages Tab* enabled in your Slack app settings.\n"
             "\n_Reply in a blocked task thread to unblock Atlas._"
         )
 
@@ -231,8 +234,9 @@ class AtlasController:
             logger.info("Task %s approved for pre-execution resume", task.id[:8])
             return msg
 
-        if pr_number and self.pr_manager:
-            merge = await self.pr_manager.merge_pr(pr_number)
+        pr_client = self.orchestrator.pr_manager_for(task) or self.pr_manager
+        if pr_number and pr_client:
+            merge = await pr_client.merge_pr(pr_number)
             if not merge.success:
                 msg = f"PR merge failed for `{task.id[:8]}`: {merge.error}"
                 if self.slack:
@@ -391,6 +395,10 @@ class AtlasController:
             proj_cfg = self.config.projects.get(project_name)
             if proj_cfg:
                 metadata["working_dir"] = proj_cfg.repo_path
+                # Tier 2.3: configured projects get browser verification by
+                # default so regressions surface before the PR stage.
+                if proj_cfg.verify_url and "verify" not in metadata:
+                    metadata["verify"] = {"url": proj_cfg.verify_url}
                 logger.info(
                     "Task %s → project %r at %s",
                     pid, project_name, proj_cfg.repo_path,
@@ -408,6 +416,9 @@ class AtlasController:
             project_id=pid,
             metadata=metadata,
         )
+        # Tier 2.5: persist immediately — a crash before the orchestrator's
+        # first touch must not lose operator-submitted work.
+        await self.tasks.persist(task)
         logger.info("Task created via Slack: %s (project=%s)", task.id[:8], pid)
         return task
 

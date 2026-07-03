@@ -472,20 +472,37 @@ class PRPreparationManager:
         )
 
     async def has_commits_ahead(self, repo_path: str, base: str = "main") -> bool:
-        """True if branch has commits not on origin/base."""
-        import asyncio
+        """
+        True if branch has commits not on the base branch.
+
+        Tries origin/<base> first, then the local <base> ref (repos without a
+        fetched remote-tracking branch). On git errors we return True so the
+        problem surfaces as a visible PR failure instead of a silent skip.
+        """
 
         def _check() -> bool:
-            result = subprocess.run(
-                ["git", "log", f"origin/{base}..HEAD", "--oneline"],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                timeout=30,
+            last_error: str | None = None
+            for ref in (f"origin/{base}", base):
+                result = subprocess.run(
+                    ["git", "log", f"{ref}..HEAD", "--oneline"],
+                    cwd=repo_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode == 0:
+                    return bool(result.stdout.strip())
+                last_error = result.stderr.strip()
+            logger.warning(
+                "has_commits_ahead: no usable base ref %r in %s (%s) — assuming commits exist",
+                base,
+                repo_path,
+                last_error,
             )
-            return bool(result.stdout.strip())
+            return True
 
         try:
             return await asyncio.to_thread(_check)
         except Exception:
+            logger.exception("has_commits_ahead failed for %s", repo_path)
             return True

@@ -67,36 +67,62 @@ class SlackBot:
 
         @self._app.event("message")
         async def on_message(event, say, logger):  # noqa: ARG001
-            # Thread replies to unblock tasks
             if event.get("subtype"):
-                return
-            if not event.get("thread_ts"):
-                return
-            text = event.get("text", "")
-            if text.strip().startswith("/atlas"):
                 return
 
             channel_id = event.get("channel")
             user_id = event.get("user")
-            thread_ts = event.get("thread_ts")
+            text = (event.get("text") or "").strip()
 
-            allowed, msg = is_authorized(
+            # Thread replies to unblock tasks
+            if event.get("thread_ts"):
+                if text.startswith("/atlas"):
+                    return
+
+                allowed, msg = is_authorized(
+                    self.config, user_id=user_id, channel_id=channel_id
+                )
+                if not allowed:
+                    return
+
+                if not self._controller:
+                    return
+
+                handled = await self._controller.handle_thread_reply(
+                    channel_id=channel_id,
+                    thread_ts=event.get("thread_ts"),
+                    text=text,
+                    user_id=user_id,
+                )
+                if handled:
+                    logger.info("Thread reply applied for blocked task")
+                return
+
+            # DM to the bot (requires Messages Tab enabled in Slack app settings)
+            channel_type = event.get("channel_type")
+            is_dm = channel_type == "im" or (
+                channel_id and str(channel_id).startswith("D")
+            )
+            if not is_dm or not text or text.startswith("/"):
+                return
+
+            allowed, deny = is_authorized(
                 self.config, user_id=user_id, channel_id=channel_id
             )
             if not allowed:
+                await say(deny)
                 return
-
             if not self._controller:
+                await say("Atlas controller not ready.")
                 return
 
-            handled = await self._controller.handle_thread_reply(
-                channel_id=channel_id,
-                thread_ts=thread_ts,
-                text=text,
-                user_id=user_id,
+            reply = await self._controller.handle_command(
+                text,
+                user_id=user_id or "",
+                channel_id=channel_id or "",
             )
-            if handled:
-                logger.info("Thread reply applied for blocked task")
+            await say(reply)
+            logger.info("Handled Atlas DM command from %s", user_id)
 
         @self._app.event("app_mention")
         async def on_mention(event, say, logger):  # noqa: ARG001
