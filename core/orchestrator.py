@@ -134,6 +134,9 @@ class Orchestrator:
             await self.memory_coordinator.initialize()
             logger.info("Operational memory layer active")
 
+        if self.tmux and self.tmux.is_available():
+            await self.tmux.ensure_server()
+
         if self.runtime and self.config.runtime.enabled:
             await self.runtime.startup(
                 self.tasks, self.task_store, self.tmux, slack=self.slack
@@ -208,7 +211,16 @@ class Orchestrator:
             logger.info("Agents registered: %s", [a.name for a in self.agents])
 
         if self.worker_pools and self.worker_pools.enabled:
+            self.worker_pools.load_state(self._pool_state_path)
             self.worker_pools.sync_from_tasks(self.tasks)
+            if self.config.runtime.orphan_session_cleanup:
+                cleaned = await self.worker_pools.cleanup_orphan_sessions(self.tasks)
+                if cleaned:
+                    logger.info(
+                        "Cleaned %d orphan pool tmux session(s): %s",
+                        len(cleaned),
+                        ", ".join(cleaned),
+                    )
             logger.info(
                 "Worker pools active: %s",
                 [p.pool_id for p in self.worker_pools.registry.all_pools()],
@@ -393,12 +405,16 @@ class Orchestrator:
         if self.worker_pools and self.worker_pools.enabled:
             self.worker_pools.release_task(task)
 
+    @property
+    def _pool_state_path(self) -> Path:
+        return Path(self.config.log_dir) / "pool_state.json"
+
     async def _record_pool_result(self, task, result: TaskResult) -> None:
         if not self.worker_pools or not self.worker_pools.enabled:
             return
         prev_cooldown = self.worker_pools.auth_monitor.subscription_on_cooldown
-        self.worker_pools.record_result(task, result)
-        classification = self.worker_pools.auth_monitor._last_classification
+        classification = self.worker_pools.record_result(task, result)
+        self.worker_pools.save_state(self._pool_state_path)
 
         if (
             classification
@@ -646,9 +662,16 @@ class Orchestrator:
         *,
         phase: str = "execution",
     ) -> None:
+        recovery_active = task.recovery_enabled and "no_agent" not in result.errors
+        if recovery_active:
+            # Crash safety: _finalize_failure persists FAILED before the retry
+            # decision below is made. If Atlas dies in that window, boot
+            # recovery re-queues FAILED+recovery_pending instead of stranding
+            # the task. Cleared on every durable outcome (retry/block/fail).
+            task.metadata["recovery_pending"] = True
         await self._finalize_failure(task, result, notify_slack=False)
 
-        if not task.recovery_enabled or "no_agent" in result.errors:
+        if not recovery_active:
             await self._notify_failure_slack(task, result)
             block = detect_block(result, task)
             if block and self.controller:
@@ -699,6 +722,8 @@ class Orchestrator:
             await self._escalate(task, result, plan)
             return
 
+        task.metadata.pop("recovery_pending", None)
+        await self.tasks.persist(task)
         await self._notify_failure_slack(task, result)
         block = detect_block(result, task)
         if block and self.controller:
@@ -760,6 +785,7 @@ class Orchestrator:
         elif follow_up.action == RecoveryAction.ESCALATE:
             await self._escalate(task, result, follow_up)
         else:
+            task.metadata.pop("recovery_pending", None)
             self.tasks.update_status(task.id, TaskStatus.FAILED)
             await self.tasks.persist(task)
 
@@ -772,6 +798,7 @@ class Orchestrator:
         )
 
         self.recovery.apply_retry_to_task(task, plan)
+        task.metadata.pop("recovery_pending", None)
         task.metadata.setdefault("recovery_chain", []).append(
             {
                 "attempt": plan.attempt_number,
@@ -799,6 +826,7 @@ class Orchestrator:
         await self.tasks.persist(task)
 
     async def _escalate(self, task, result: TaskResult, plan) -> None:
+        task.metadata.pop("recovery_pending", None)
         reason = plan.escalation_reason or "Recovery exhausted"
         summary = self._escalation_summary(task, plan)
         task.metadata["escalation_summary"] = summary
@@ -818,6 +846,7 @@ class Orchestrator:
     async def _escalate_safety(self, task, result: TaskResult, reason: str) -> None:
         from core.attempt_history import AttemptHistory
 
+        task.metadata.pop("recovery_pending", None)
         summary = (
             f"*Safety escalation*\n{reason}\n"
             f"Attempts: {len(AttemptHistory.load(task))}\n"

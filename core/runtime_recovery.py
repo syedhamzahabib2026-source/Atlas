@@ -87,6 +87,16 @@ class RuntimeRecovery:
         """RUNNING/VERIFYING cannot continue after reboot — re-queue safely."""
         for task in task_manager.list_all():
             new_status = _RESET_ON_BOOT.get(task.status)
+            # FAILED with a recovery decision still pending means Atlas died
+            # between persisting FAILED and scheduling the retry — re-queue
+            # instead of stranding the task.
+            if (
+                new_status is None
+                and task.status == TaskStatus.FAILED
+                and task.metadata.get("recovery_pending")
+            ):
+                new_status = TaskStatus.PENDING
+                task.metadata.pop("recovery_pending", None)
             if new_status:
                 old = task.status.value
                 task_manager.update_status(task.id, new_status)
@@ -125,12 +135,18 @@ class RuntimeRecovery:
                     f"Task {task.id[:8]} expected session {session} — not found"
                 )
 
-        # Orphan tmux sessions (no matching active task)
+        # Orphan tmux sessions (no matching active task). Only touch sessions
+        # owned by THIS manager's prefix — never atlas-sub-* when prefix is atlas.
+        _OTHER_POOL_PREFIXES = ("atlas-sub-", "atlas-api-", "atlas-local-")
         task_sessions = {
             t.session_name for t in task_manager.list_all() if t.session_name
         }
         for name in live_sessions:
-            if not name.startswith(prefix):
+            if not name.startswith(f"{prefix}-"):
+                continue
+            if prefix == "atlas" and any(
+                name.startswith(other) for other in _OTHER_POOL_PREFIXES
+            ):
                 continue
             if name not in task_sessions:
                 report.sessions_orphaned.append(name)

@@ -67,6 +67,7 @@ class ClaudeCodeConfig:
     capture_lines: int = 200
     kill_session_on_finish: bool = False
     kill_session_on_success: bool = True
+    execution_mode: str = "tmux"  # "tmux" | "headless"
 
 
 @dataclass
@@ -230,7 +231,7 @@ def load_config(
             ),
         ),
         tmux_session_prefix=sessions_cfg.get("session_prefix", "atlas"),
-        tmux_socket=sessions_cfg.get("tmux_socket"),
+        tmux_socket=sessions_cfg.get("tmux_socket") or "/tmp/atlas-tmux.sock",
         screenshots_dir=root / browser_cfg.get("screenshots_dir", "logs/screenshots"),
         browser=BrowserConfig(
             headless=_env_bool("ATLAS_BROWSER_HEADLESS", browser_cfg.get("headless", True)),
@@ -339,6 +340,10 @@ def load_config(
             kill_session_on_success=_env_bool(
                 "ATLAS_CLAUDE_KILL_SESSION_ON_SUCCESS",
                 claude_cfg.get("kill_session_on_success", True),
+            ),
+            execution_mode=_env(
+                "ATLAS_CLAUDE_EXECUTION_MODE",
+                claude_cfg.get("execution_mode", "tmux"),
             ),
         ),
         runtime=RuntimeConfig(

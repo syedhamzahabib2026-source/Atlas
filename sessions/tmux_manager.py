@@ -8,7 +8,9 @@ Uses subprocess with timeouts; on Windows falls back to WSL tmux when available.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,8 +22,18 @@ from core.logger import get_logger
 
 logger = get_logger("sessions.tmux")
 
+# Stable socket shared by every TmuxManager (main + worker pools). Avoids WSL
+# default-socket races where the server vanishes between subprocess calls.
+DEFAULT_TMUX_SOCKET = "/tmp/atlas-tmux.sock"
+
 # Subprocess timeout for individual tmux commands (seconds)
 _CMD_TIMEOUT = 30
+
+_SERVER_ERRORS = (
+    "error connecting",
+    "no server running",
+    "connection refused",
+)
 
 
 class TmuxBackend(str, Enum):
@@ -43,10 +55,10 @@ class TmuxManager:
     def __init__(
         self,
         session_prefix: str = "atlas",
-        socket_path: str | None = None,
+        socket_path: str | None = DEFAULT_TMUX_SOCKET,
     ) -> None:
         self.session_prefix = session_prefix
-        self.socket_path = socket_path
+        self.socket_path = socket_path or DEFAULT_TMUX_SOCKET
         self._backend = self._detect_backend()
         logger.info("Tmux backend: %s", self._backend.value)
 
@@ -77,14 +89,39 @@ class TmuxManager:
     def is_available(self) -> bool:
         return self._backend != TmuxBackend.UNAVAILABLE
 
-    def _base_cmd(self) -> list[str]:
-        if self._backend == TmuxBackend.WSL:
-            cmd = ["wsl", "tmux"]
-        else:
-            cmd = ["tmux"]
+    def _tmux_argv(self, args: list[str]) -> list[str]:
+        """Build tmux argv including socket path."""
+        argv: list[str] = ["tmux"]
         if self.socket_path:
-            cmd.extend(["-S", self.socket_path])
-        return cmd
+            argv.extend(["-S", self.socket_path])
+        argv.extend(args)
+        return argv
+
+    def _exec_cmd(self, args: list[str]) -> list[str]:
+        """
+        Build the subprocess argv for a tmux invocation.
+
+        On WSL, run tmux inside `bash -lc` so every command shares one stable
+        server context. Bare `wsl tmux` from Windows can leave the socket in
+        a dead-server state between asyncio subprocess calls.
+        """
+        if self._backend == TmuxBackend.WSL:
+            script = " ".join(shlex.quote(part) for part in self._tmux_argv(args))
+            return ["wsl", "bash", "-lc", script]
+        return self._tmux_argv(args)
+
+    @staticmethod
+    def _is_server_error(result: TmuxRunResult) -> bool:
+        err = result.stderr.lower()
+        return any(marker in err for marker in _SERVER_ERRORS)
+
+    async def ensure_server(self) -> None:
+        """Start the shared tmux server if it is not already running."""
+        if not self.is_available():
+            return
+        result = await self._run(["start-server"], log_level=logging.DEBUG)
+        if result.returncode == 0:
+            logger.debug("tmux server ready (socket=%s)", self.socket_path)
 
     @staticmethod
     def _normalize_working_dir(working_dir: str | Path | None) -> str | None:
@@ -110,7 +147,7 @@ class TmuxManager:
         timeout: float = _CMD_TIMEOUT,
         log_level: int = logging.DEBUG,
     ) -> TmuxRunResult:
-        cmd = [*self._base_cmd(), *args]
+        cmd = self._exec_cmd(args)
         logger.log(log_level, "tmux exec: %s", " ".join(cmd))
 
         try:
@@ -132,14 +169,31 @@ class TmuxManager:
 
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
-        if proc.returncode != 0:
+        result = TmuxRunResult(proc.returncode, stdout, stderr)
+        if proc.returncode != 0 and self._is_server_error(result):
+            await self._run(["start-server"], log_level=logging.DEBUG)
+            proc2 = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_b2, stderr_b2 = await asyncio.wait_for(
+                proc2.communicate(),
+                timeout=timeout,
+            )
+            result = TmuxRunResult(
+                proc2.returncode,
+                stdout_b2.decode(errors="replace"),
+                stderr_b2.decode(errors="replace"),
+            )
+        if result.returncode != 0:
             logger.warning(
                 "tmux command failed (rc=%s): %s | stderr=%s",
-                proc.returncode,
+                result.returncode,
                 " ".join(args[:4]),
-                stderr.strip()[:500],
+                result.stderr.strip()[:500],
             )
-        return TmuxRunResult(proc.returncode, stdout, stderr)
+        return result
 
     async def list_sessions(self) -> list[str]:
         if not self.is_available():
@@ -186,6 +240,8 @@ class TmuxManager:
                 "tmux is not available. Install tmux (or use WSL on Windows)."
             )
 
+        await self.ensure_server()
+
         if await self.session_exists(session_name):
             logger.info("Reusing existing tmux session: %s", session_name)
             return True
@@ -210,7 +266,105 @@ class TmuxManager:
             )
             return False
 
+        # WSL tmux can report rc=0 from new-session while the server is still
+        # settling (or already dead if start_command exited). Verify before
+        # returning success.
+        await asyncio.sleep(0.25)
+        if not await self.session_exists(session_name):
+            logger.warning(
+                "Session %s missing after create; restarting tmux server",
+                session_name,
+            )
+            await self.ensure_server()
+            if not await self.session_exists(session_name):
+                logger.error("Session %s not found after create", session_name)
+                return False
+
+        # Best-effort: keep pane visible if Claude crashes so Atlas can inspect.
+        await self._run(
+            ["set-option", "-t", session_name, "remain-on-exit", "on"],
+            log_level=logging.DEBUG,
+        )
+
         logger.info("Created tmux session: %s", session_name)
+        return True
+
+    async def set_session_environment(
+        self,
+        session_name: str,
+        name: str,
+        value: str,
+    ) -> bool:
+        """Set a tmux session environment variable (visible to shell children)."""
+        await self.ensure_server()
+        result = await self._run(
+            ["set-environment", "-t", session_name, name, value],
+            log_level=logging.INFO,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "set-environment %s on %s failed: %s",
+                name,
+                session_name,
+                result.stderr.strip()[:200],
+            )
+            return False
+        return True
+
+    async def _send_via_buffer(self, session_name: str, text: str, *, enter: bool) -> bool:
+        """
+        Paste multi-line / long text through a tmux buffer.
+
+        Avoids WSL argument-parsing bugs with embedded newlines and quotes.
+        Buffer and temp-file names are unique per call: a shared name lets two
+        concurrent sends paste task A's prompt into task B's session.
+        """
+        import uuid
+
+        token = uuid.uuid4().hex[:12]
+        buf_name = f"atlasq-{token}"
+        tmp_file = f"/tmp/atlas-send-{token}.txt"
+        payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        paste_argv = self._tmux_argv(
+            ["load-buffer", "-b", buf_name, tmp_file],
+        )
+        paste_buf = self._tmux_argv(
+            ["paste-buffer", "-d", "-b", buf_name, "-t", session_name]
+        )
+        enter_argv = self._tmux_argv(["send-keys", "-t", session_name, "C-m"])
+        paste_cmd = " ".join(shlex.quote(p) for p in paste_argv)
+        paste_buf_cmd = " ".join(shlex.quote(p) for p in paste_buf)
+        enter_cmd = " ".join(shlex.quote(p) for p in enter_argv) if enter else "true"
+        script = (
+            f"printf '%s' '{payload}' | base64 -d > {tmp_file} && "
+            f"{paste_cmd} && {paste_buf_cmd} && {enter_cmd}; "
+            f"rc=$?; rm -f {tmp_file}; exit $rc"
+        )
+        if self._backend == TmuxBackend.WSL:
+            cmd = ["wsl", "bash", "-lc", script]
+        else:
+            cmd = ["bash", "-lc", script]
+        logger.log(logging.INFO, "tmux paste-buffer -> %s (%d chars)", session_name, len(text))
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                ),
+                timeout=_CMD_TIMEOUT,
+            )
+            _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=_CMD_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error("tmux paste-buffer timed out for %s", session_name)
+            return False
+        if proc.returncode != 0:
+            logger.warning(
+                "tmux paste-buffer failed for %s: %s",
+                session_name,
+                stderr_b.decode(errors="replace").strip()[:500],
+            )
+            return False
         return True
 
     async def send_keys(
@@ -220,19 +374,27 @@ class TmuxManager:
         *,
         enter: bool = True,
         literal: bool = True,
+        require_session: bool = True,
     ) -> bool:
         """
         Send text to the session's active pane.
 
         Uses literal mode by default so prompts are not interpreted as key names.
         """
-        if not await self.session_exists(session_name):
+        await self.ensure_server()
+        if require_session and not await self.session_exists(session_name):
             logger.error("send_keys: session does not exist: %s", session_name)
             return False
 
-        # Log a short preview, not the full prompt
         preview = command[:120] + ("..." if len(command) > 120 else "")
         logger.info("send_keys -> %s: %r", session_name, preview)
+
+        if literal and (
+            "\n" in command
+            or len(command) > 400
+            or (self._backend == TmuxBackend.WSL and len(command) > 200)
+        ):
+            return await self._send_via_buffer(session_name, command, enter=enter)
 
         args: list[str] = ["send-keys", "-t", session_name]
         if literal:
