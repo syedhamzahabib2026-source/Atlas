@@ -81,17 +81,8 @@ runtime:
 #   github_owner / github_repo   — PR target repo (token stays in GITHUB_TOKEN)
 projects:
   assignmint:
-    repo_path: "C:/Users/shamz/Desktop/Assignmint"
-    description: "AssignMint React Native app"
-    github_owner: "syedhamzahabib2026-source"
-    github_repo: "Assignmint"
-    # Quality gates — Atlas runs these after Claude finishes. Fail = retry, not "done".
-    # `npm run typecheck` fails repo-wide (pre-existing TS errors in firebase/matching).
-    # Use sanity checks that pass today and still catch broken navigation / entry point.
-    build_command: ""
-    test_command: "npm run check:entry && npm run validate:screens"
-    check_timeout_sec: 600
-    # No verify_url — mobile app, not a website Atlas can open in a browser
+    repo_path: "/Users/hamza/Desktop/Assignmint3"
+    description: "AssignMint React Native iOS (see configs/mobile.yaml)"
 
 # Worker pools — subscription-first routing, API fallback (Phase 13)
 worker_pools:

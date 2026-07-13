@@ -10,8 +10,9 @@ env/
 dist/
 build/
 logs/*.log
-logs/screenshots/*.png
-logs/screenshots/*.jpg
+logs/mobile/
+logs/screenshots/
 *.db
 .idea/
 .vscode/
+.DS_Store

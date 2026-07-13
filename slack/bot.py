@@ -73,9 +73,10 @@ class SlackBot:
             channel_id = event.get("channel")
             user_id = event.get("user")
             text = (event.get("text") or "").strip()
+            thread_ts = event.get("thread_ts")
 
             # Thread replies to unblock tasks (slash commands don't work in threads)
-            if event.get("thread_ts"):
+            if thread_ts:
                 allowed, deny = is_authorized(
                     self.config, user_id=user_id, channel_id=channel_id
                 )
@@ -84,8 +85,6 @@ class SlackBot:
 
                 if not self._controller:
                     return
-
-                thread_ts = event.get("thread_ts")
 
                 # /atlas retry|complete and bare "retry" / "complete" in escalation threads.
                 cmd_text: str | None = None
@@ -142,7 +141,24 @@ class SlackBot:
                         logger.info("DM reply unblocked task for %s", user_id)
                         return
 
-            if not is_dm or not text or text.startswith("/"):
+            if not text or text.startswith("/"):
+                return
+
+            if not is_dm:
+                # Top-level channel message — match by task ID embedded in the
+                # text so users can unblock without knowing about threads.
+                allowed, _ = is_authorized(
+                    self.config, user_id=user_id, channel_id=channel_id
+                )
+                if not allowed or not self._controller:
+                    return
+                handled = await self._controller.handle_direct_message(
+                    channel_id=channel_id,
+                    text=text,
+                    user_id=user_id,
+                )
+                if handled:
+                    logger.info("Direct message with task ID unblocked a task")
                 return
 
             allowed, deny = is_authorized(

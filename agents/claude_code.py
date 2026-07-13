@@ -193,7 +193,13 @@ class ClaudeCodeAgent(BaseAgent):
         return fallback.resolve()
 
     def _build_prompt(self, task: Task, *, headless: bool = False) -> str:
-        parts: list[str] = []
+        parts: list[str] = [
+            "You are in autonomous execution mode. Do not explain your plan. "
+            "Do not ask questions. Do not summarize what you are about to do. "
+            "Immediately open the files and make the required changes. "
+            "Start editing now. When done, run git add -A && git commit -m 'atlas: <description>'. "
+            "Do not stop until the files are edited and committed."
+        ]
         if ctx := task.metadata.get("operational_context"):
             parts.append(str(ctx))
         if custom := task.metadata.get("prompt"):
@@ -339,14 +345,25 @@ class ClaudeCodeAgent(BaseAgent):
         if not state.session_name:
             raise RuntimeError("start_session() must be called first")
 
+        await self._ensure_session_ready(task, state)
+
+        # Wipe the pane's scrollback before each task so stale output from a
+        # previously reused session can never trigger false-positive detection.
+        cleared = await state.tmux.clear_history(state.session_name)
+        if not cleared:
+            logger.warning(
+                "send_prompt: clear_history failed for %s — stale scrollback may remain",
+                state.session_name,
+            )
+
         text = prompt or self._build_prompt(task)
+
         logger.info(
             "send_prompt: session=%s chars=%d",
             state.session_name,
             len(text),
         )
 
-        await self._ensure_session_ready(task, state)
         ok = await state.tmux.send_keys(state.session_name, text)
         if not ok:
             await self._ensure_session_ready(task, state)

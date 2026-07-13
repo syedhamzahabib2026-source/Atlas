@@ -671,6 +671,34 @@ class AtlasController:
         task.metadata["recovery_attempt_count"] = 0
         task.metadata["failure_count"] = 0
 
+    async def handle_direct_message(
+        self,
+        *,
+        channel_id: str,
+        text: str,
+        user_id: str,
+    ) -> bool:
+        """
+        Handle a top-level (non-thread) Slack message that contains a blocked
+        task ID.  Users can unblock a task without knowing about Slack threads
+        by just posting the task ID (8+ hex chars) and their guidance anywhere
+        in the channel.
+
+        Returns True if a blocked task was found and unblocked.
+        """
+        task = self.tasks.find_blocked_by_id_in_text(text)
+        if not task:
+            return False
+
+        # Honour the channel from this message so replies land in context.
+        task.metadata.setdefault("slack_channel_id", channel_id)
+        await self.unblock_task(task, text.strip(), user_id=user_id)
+        logger.info(
+            "Task %s unblocked via direct channel message (user=%s)",
+            task.id[:8], user_id,
+        )
+        return True
+
     async def unblock_task(
         self,
         task: Task,

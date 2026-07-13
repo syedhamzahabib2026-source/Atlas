@@ -76,7 +76,7 @@ class Orchestrator:
             config.recovery,
             log_dir=config.log_dir,
         )
-        self.git_safety = git_safety or GitSafetyCoordinator(config.git)
+        self.git_safety = git_safety or GitSafetyCoordinator(config.git, projects=config.projects)
         self._running = False
         self._cancel_events: dict[str, asyncio.Event] = {}
         self.controller = None
@@ -924,8 +924,8 @@ class Orchestrator:
             task, assessment, ApprovalPhase.PRE_EXECUTION
         )
         self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
-        await self.tasks.persist(task)
         await self.approval_engine.pause_for_approval(task, context, update_status=False)
+        await self.tasks.persist(task)
         if self.slack and self.config.slack_ready:
             await self.slack.notify_approval_waiting(task, "pre_execution")
         return False
@@ -1042,8 +1042,8 @@ class Orchestrator:
                 task, assessment, ApprovalPhase.PR_CREATION, result=result
             )
             self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+            await self.approval_engine.pause_for_approval(task, context, update_status=False)
             await self.tasks.persist(task)
-            await self.approval_engine.pause_for_approval(task, context)
             if self.slack and self.config.slack_ready:
                 await self.slack.notify_high_risk_detected(task, assessment.risk_level.value)
                 await self.slack.notify_approval_waiting(task, "pr_creation")
@@ -1054,8 +1054,8 @@ class Orchestrator:
                 task, assessment, ApprovalPhase.PR_CREATION, result=result
             )
             self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+            await self.approval_engine.pause_for_approval(task, context, update_status=False)
             await self.tasks.persist(task)
-            await self.approval_engine.pause_for_approval(task, context)
             if self.slack and self.config.slack_ready:
                 await self.slack.notify_approval_waiting(task, "post_execution")
             return
@@ -1105,8 +1105,8 @@ class Orchestrator:
             context.pr_number = prep.candidate.pr_number
 
         self.tasks.update_status(task.id, TaskStatus.WAITING_APPROVAL)
+        await self.approval_engine.pause_for_approval(task, context, update_status=False)
         await self.tasks.persist(task)
-        await self.approval_engine.pause_for_approval(task, context)
 
         if self.slack and self.config.slack_ready:
             await self.slack.notify_pr_candidate_prepared(task, prep.candidate)
