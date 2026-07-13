@@ -87,6 +87,23 @@ class TestFatalMarkers:
         assert complete
         assert reason.startswith("error_detected")
 
+    def test_fable5_promo_does_not_false_positive(self, agent):
+        # Claude Code welcome banner mentions "weekly usage limit on Fable 5"
+        out = (
+            "Fable 5 is back.\n"
+            "Until July 7, you can use up to 50% of your plan's weekly usage limit on\n"
+            "Fable 5. If you hit your limit, you can continue on Fable 5 with usage\n"
+            "credits.\n"
+            "\u203a "
+        )
+        complete, _ = detect(agent, out)
+        assert not complete
+
+    def test_real_usage_limit_still_fails(self, agent):
+        complete, reason = detect(agent, "Error: usage limit reached for this session")
+        assert complete
+        assert reason.startswith("error_detected")
+
 
 class TestIdleDetection:
     def test_idle_at_prompt_completes_when_stable(self, agent):

@@ -121,6 +121,14 @@ class AtlasController:
             tid = next((a for a in parsed.args if not a.startswith("--")), None)
             return await self.stop_task(tid, kill_session=kill)
 
+        if sub == "retry":
+            tid = next((a for a in parsed.args if not a.startswith("--")), None)
+            return await self._handle_retry(tid, user_id=user_id, channel_id=channel_id)
+
+        if sub == "complete":
+            tid = next((a for a in parsed.args if not a.startswith("--")), None)
+            return await self._handle_complete(tid, channel_id=channel_id)
+
         if sub == "status":
             return self.format_status()
 
@@ -181,6 +189,8 @@ class AtlasController:
             "*Atlas commands*\n"
             "• `/atlas start [--project <name>] <prompt>` — queue a Claude Code task\n"
             "• `/atlas stop [task_id] [--kill]` — cancel running task\n"
+            "• `/atlas retry [task_id]` — re-queue a blocked task (or latest blocked)\n"
+            "• `/atlas complete [task_id]` — finish a blocked task when work is already committed\n"
             "• `/atlas approve <task_id>` — approve changes (merge PR if prepared)\n"
             "• `/atlas reject <task_id> <reason>` — reject and stop\n"
             "• `/atlas request_changes <task_id> <feedback>` — send back for rework\n"
@@ -192,6 +202,8 @@ class AtlasController:
             "• `/atlas rollback_release <task_id> <reason>` — rollback release\n"
             "• `/atlas deployment_status [task_id]` — delivery / CI status\n"
             "\n_Use `/atlas …` (slash command), not plain chat._ "
+            "To resume a blocked task: reply in the blocked thread, send any DM message, "
+            "or run `/atlas retry`. "
             "In a channel, invite @Atlas first. "
             "Plain-text DMs need *Messages Tab* enabled in your Slack app settings.\n"
             "\n_Reply in a blocked task thread to unblock Atlas._"
@@ -539,7 +551,7 @@ class AtlasController:
         self,
         *,
         channel_id: str,
-        thread_ts: str,
+        thread_ts: str | None,
         text: str,
         user_id: str,
     ) -> bool:
@@ -554,6 +566,110 @@ class AtlasController:
 
         await self.unblock_task(task, text.strip(), user_id=user_id)
         return True
+
+    async def _handle_retry(
+        self,
+        task_id: str | None,
+        *,
+        user_id: str | None = None,
+        channel_id: str | None = None,
+    ) -> str:
+        task = self._resolve_task_id(task_id) if task_id else None
+        if not task and channel_id:
+            task = self.tasks.find_blocked_by_thread(channel_id, thread_ts=None)
+        if not task:
+            return (
+                "No blocked task found to retry. "
+                "Use `/atlas retry <task_id>` or reply in the blocked thread."
+            )
+        if task.status != TaskStatus.BLOCKED:
+            return f"Task `{task.id[:8]}` is `{task.status.value}` — not blocked."
+
+        await self.unblock_task(
+            task,
+            "Manual retry via /atlas retry",
+            user_id=user_id,
+        )
+        return f"Task `{task.id[:8]}` re-queued — Atlas will retry now."
+
+    async def _handle_complete(
+        self,
+        task_id: str | None,
+        *,
+        channel_id: str | None = None,
+    ) -> str:
+        """Finish a task when work is already on the branch (skip Claude)."""
+        task = self._resolve_task_id(task_id) if task_id else None
+        if not task and channel_id:
+            task = self.tasks.find_blocked_by_thread(channel_id, thread_ts=None)
+        if not task:
+            return (
+                "No task found. Use `/atlas complete <task_id>` or reply "
+                "`complete fec9bffe` in the blocked thread."
+            )
+
+        if task.status == TaskStatus.COMPLETED:
+            return f"Task `{task.id[:8]}` is already complete."
+
+        self._reset_recovery_state(task)
+        session = (
+            task.metadata.get("session_name")
+            or task.session_name
+            or "manual-complete"
+        )
+        result = TaskResult(
+            status=ResultStatus.COMPLETED,
+            summary="Manual completion via /atlas complete",
+            session_name=session,
+            metadata={"task_id": task.id, "manual_complete": True},
+        )
+        result.finish()
+
+        orch = self.orchestrator
+        if not await orch._verify_success_evidence(task, result):
+            await self.tasks.persist(task)
+            return (
+                f"Cannot complete `{task.id[:8]}` — {result.summary}\n"
+                "Commit your changes on the task branch first, then retry."
+            )
+        if not await orch._run_quality_gates(task, result):
+            await self.tasks.persist(task)
+            return f"Quality gates failed for `{task.id[:8]}`: {result.summary}"
+
+        await orch._finalize_success(task, result)
+        await self.tasks.persist(task)
+        return f"Task `{task.id[:8]}` marked complete — work verified on branch."
+
+    def _reset_recovery_state(self, task: Task) -> None:
+        """Clear retry counters and pool binding so a human retry starts fresh."""
+        if hist := task.metadata.pop("attempt_history", None):
+            archive = task.metadata.setdefault("prior_attempt_histories", [])
+            archive.append(
+                {
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
+                    "attempts": hist,
+                }
+            )
+            task.metadata["prior_attempt_histories"] = archive[-3:]
+
+        for key in (
+            "recovery_strategy",
+            "last_failure",
+            "recovery_chain",
+            "investigation_report",
+            "investigation_complete",
+            "worker_pool",
+            "session_prefix",
+            "pool_auth_mode",
+            "pool_cost_tier",
+            "routing_reason",
+            "routing_overflow",
+            "session_name",
+        ):
+            task.metadata.pop(key, None)
+
+        task.metadata["recovery_attempt_count"] = 0
+        task.metadata["failure_count"] = 0
 
     async def unblock_task(
         self,
@@ -570,10 +686,11 @@ class AtlasController:
         task.metadata["unblocked_by"] = user_id
         task.metadata["unblocked_at"] = datetime.now(timezone.utc).isoformat()
         task.metadata.pop("blocked_question", None)
+        self._reset_recovery_state(task)
         base = task.metadata.get("prompt") or task.description
         task.metadata["prompt"] = f"{base}\n\nHuman clarification:\n{response}"
-        task.metadata["failure_count"] = 0
         self.tasks.update_status(task.id, TaskStatus.PENDING, error=None)
+        await self.tasks.persist(task)
         logger.info("Task %s unblocked via Slack", task.id[:8])
 
         if self.slack:
@@ -602,6 +719,9 @@ class AtlasController:
                 f"*Atlas blocked* ({block_reason_label(reason)})\n{question}",
             )
             if parent_ts:
-                task.metadata["slack_thread_ts"] = parent_ts
+                task.metadata["blocked_slack_thread_ts"] = parent_ts
+                if not task.metadata.get("slack_thread_ts"):
+                    task.metadata["slack_thread_ts"] = parent_ts
 
+        await self.tasks.persist(task)
         logger.info("Task %s blocked: %s", task.id[:8], reason)
