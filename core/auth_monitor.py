@@ -31,16 +31,16 @@ class AuthFailureKind(str, Enum):
     AUTH_GENERIC = "auth_generic"
 
 
-# Centralized markers — single source for exhaustion heuristics
+# Centralized markers — specific phrases only (see claude_code._FATAL_MARKERS).
 _EXHAUSTION_MARKERS = (
-    "rate limit",
-    "rate_limit",
-    "usage limit",
+    "rate limit exceeded",
+    "rate_limit exceeded",
+    "usage limit reached",
+    "usage limit exceeded",
+    "hit your usage limit",
     "quota exceeded",
     "out of credits",
-    "billing",
-    "subscription",
-    "plan limit",
+    "plan limit reached",
     "too many requests",
     "429",
     "overloaded",
@@ -88,7 +88,6 @@ class AuthMonitor:
         self.registry = registry
         self.exhaustion_threshold = exhaustion_threshold
         self._subscription_failure_streak = 0
-        self._last_classification: AuthClassification | None = None
 
     def classify(self, result: TaskResult, task: Task | None = None) -> AuthClassification:
         text = " ".join(
@@ -154,7 +153,6 @@ class AuthMonitor:
     ) -> AuthClassification:
         """Record failure and apply pool cooldown if warranted."""
         classification = self.classify(result, task)
-        self._last_classification = classification
 
         if pool.pool_id == "subscription":
             if classification.kind != AuthFailureKind.NONE:

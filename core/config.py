@@ -66,6 +66,8 @@ class ClaudeCodeConfig:
     idle_stable_polls: int = 3
     capture_lines: int = 200
     kill_session_on_finish: bool = False
+    kill_session_on_success: bool = True
+    execution_mode: str = "tmux"  # "tmux" | "headless"
 
 
 @dataclass
@@ -74,6 +76,15 @@ class ProjectConfig:
 
     repo_path: str
     description: str = ""
+    # Quality gate commands — run in repo_path after Claude finishes (Tier 2)
+    test_command: str = ""
+    build_command: str = ""
+    check_timeout_sec: int = 600
+    # Default browser verification target (Tier 2.3)
+    verify_url: str = ""
+    # Per-project GitHub target for PR lifecycle (Tier 3.1); token stays in env
+    github_owner: str = ""
+    github_repo: str = ""
 
 
 def _env_list(key: str, default: list[str] | None = None) -> list[str]:
@@ -183,6 +194,12 @@ def load_config(
         name: ProjectConfig(
             repo_path=p.get("repo_path", ""),
             description=p.get("description", ""),
+            test_command=p.get("test_command", ""),
+            build_command=p.get("build_command", ""),
+            check_timeout_sec=int(p.get("check_timeout_sec", 600)),
+            verify_url=p.get("verify_url", ""),
+            github_owner=p.get("github_owner", ""),
+            github_repo=p.get("github_repo", ""),
         )
         for name, p in (projects_cfg or {}).items()
         if isinstance(p, dict) and p.get("repo_path")
@@ -214,7 +231,7 @@ def load_config(
             ),
         ),
         tmux_session_prefix=sessions_cfg.get("session_prefix", "atlas"),
-        tmux_socket=sessions_cfg.get("tmux_socket"),
+        tmux_socket=sessions_cfg.get("tmux_socket") or "/tmp/atlas-tmux.sock",
         screenshots_dir=root / browser_cfg.get("screenshots_dir", "logs/screenshots"),
         browser=BrowserConfig(
             headless=_env_bool("ATLAS_BROWSER_HEADLESS", browser_cfg.get("headless", True)),
@@ -319,6 +336,14 @@ def load_config(
             kill_session_on_finish=_env_bool(
                 "ATLAS_CLAUDE_KILL_SESSION",
                 claude_cfg.get("kill_session_on_finish", False),
+            ),
+            kill_session_on_success=_env_bool(
+                "ATLAS_CLAUDE_KILL_SESSION_ON_SUCCESS",
+                claude_cfg.get("kill_session_on_success", True),
+            ),
+            execution_mode=_env(
+                "ATLAS_CLAUDE_EXECUTION_MODE",
+                claude_cfg.get("execution_mode", "tmux"),
             ),
         ),
         runtime=RuntimeConfig(

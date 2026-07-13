@@ -69,25 +69,41 @@ class SlackBot:
         async def on_message(event, say, logger):  # noqa: ARG001
             if event.get("subtype"):
                 return
-            text = event.get("text", "")
-            if text.strip().startswith("/atlas"):
-                return
 
             channel_id = event.get("channel")
             user_id = event.get("user")
+            text = (event.get("text") or "").strip()
             thread_ts = event.get("thread_ts")
 
-            allowed, _ = is_authorized(
-                self.config, user_id=user_id, channel_id=channel_id
-            )
-            if not allowed:
-                return
-
-            if not self._controller:
-                return
-
+            # Thread replies to unblock tasks (slash commands don't work in threads)
             if thread_ts:
-                # Thread reply — match by Slack thread ancestry.
+                allowed, deny = is_authorized(
+                    self.config, user_id=user_id, channel_id=channel_id
+                )
+                if not allowed:
+                    return
+
+                if not self._controller:
+                    return
+
+                # /atlas retry|complete and bare "retry" / "complete" in escalation threads.
+                cmd_text: str | None = None
+                if text.startswith("/atlas"):
+                    cmd_text = text[len("/atlas") :].strip() or "help"
+                elif text.lower().startswith("retry") or text.lower().startswith("complete"):
+                    cmd_text = text
+
+                if cmd_text is not None:
+                    reply = await self._controller.handle_command(
+                        cmd_text,
+                        user_id=user_id or "",
+                        channel_id=channel_id or "",
+                        thread_ts=thread_ts,
+                    )
+                    await say(reply, thread_ts=thread_ts)
+                    logger.info("Thread command handled: %s", cmd_text.split()[0])
+                    return
+
                 handled = await self._controller.handle_thread_reply(
                     channel_id=channel_id,
                     thread_ts=thread_ts,
@@ -95,10 +111,47 @@ class SlackBot:
                     user_id=user_id,
                 )
                 if handled:
+                    await say("Got it — resuming the blocked task.", thread_ts=thread_ts)
                     logger.info("Thread reply applied for blocked task")
-            else:
-                # Top-level message — match by task ID embedded in the text so
-                # users can unblock without knowing about threads.
+                return
+
+            # DM to the bot — check blocked tasks before treating as a command
+            channel_type = event.get("channel_type")
+            is_dm = channel_type == "im" or (
+                channel_id and str(channel_id).startswith("D")
+            )
+            if is_dm and text and not text.startswith("/"):
+                allowed, deny = is_authorized(
+                    self.config, user_id=user_id, channel_id=channel_id
+                )
+                if not allowed:
+                    await say(deny)
+                    return
+                if self._controller:
+                    handled = await self._controller.handle_thread_reply(
+                        channel_id=channel_id,
+                        thread_ts=None,
+                        text=text,
+                        user_id=user_id or "",
+                    )
+                    if handled:
+                        await say(
+                            f"Task unblocked. Atlas is retrying with your message."
+                        )
+                        logger.info("DM reply unblocked task for %s", user_id)
+                        return
+
+            if not text or text.startswith("/"):
+                return
+
+            if not is_dm:
+                # Top-level channel message — match by task ID embedded in the
+                # text so users can unblock without knowing about threads.
+                allowed, _ = is_authorized(
+                    self.config, user_id=user_id, channel_id=channel_id
+                )
+                if not allowed or not self._controller:
+                    return
                 handled = await self._controller.handle_direct_message(
                     channel_id=channel_id,
                     text=text,
@@ -106,6 +159,25 @@ class SlackBot:
                 )
                 if handled:
                     logger.info("Direct message with task ID unblocked a task")
+                return
+
+            allowed, deny = is_authorized(
+                self.config, user_id=user_id, channel_id=channel_id
+            )
+            if not allowed:
+                await say(deny)
+                return
+            if not self._controller:
+                await say("Atlas controller not ready.")
+                return
+
+            reply = await self._controller.handle_command(
+                text,
+                user_id=user_id or "",
+                channel_id=channel_id or "",
+            )
+            await say(reply)
+            logger.info("Handled Atlas DM command from %s", user_id)
 
         @self._app.event("app_mention")
         async def on_mention(event, say, logger):  # noqa: ARG001
@@ -212,6 +284,8 @@ class SlackBot:
         thread = task.metadata.get("slack_thread_ts")
         body = f"{text}\n\n_Task ID: `{task.id}` — reply in this thread to continue._"
         ts = await self.notify(body, channel_id=channel, thread_ts=thread)
+        if ts:
+            task.metadata["blocked_slack_thread_ts"] = ts
         return thread or ts
 
     async def notify_task_started(self, task: Task) -> None:

@@ -41,6 +41,7 @@ class PoolMetrics:
     tasks_failed: int = 0
     tasks_recovered: int = 0
     total_runtime_sec: float = 0.0
+    total_cost_usd: float = 0.0
     last_task_at: float | None = None
 
     @property
@@ -136,6 +137,24 @@ class WorkerPool:
             reason,
         )
 
+    def cooldown_state(self) -> tuple[float | None, str]:
+        """(cooldown_until epoch, reason) — for persistence across restarts."""
+        return self._cooldown_until, self._cooldown_reason
+
+    def restore_cooldown(self, until: float, reason: str) -> None:
+        """Reapply a persisted cooldown; expired timestamps are ignored."""
+        if until <= time.time():
+            return
+        self._cooldown_until = until
+        self._cooldown_reason = reason
+        self._health = PoolHealth.COOLDOWN
+        logger.info(
+            "Pool %s cooldown restored (%.0fs remaining): %s",
+            self.pool_id,
+            until - time.time(),
+            reason,
+        )
+
     def clear_cooldown(self) -> None:
         if self._cooldown_until is not None:
             logger.info("Pool %s cooldown cleared", self.pool_id)
@@ -180,16 +199,22 @@ class WorkerPool:
     def release(self, task_id: str) -> None:
         self._active_task_ids.discard(task_id)
 
-    def record_success(self, task: Task, *, duration_sec: float = 0.0) -> None:
+    def record_success(
+        self, task: Task, *, duration_sec: float = 0.0, cost_usd: float = 0.0
+    ) -> None:
         self.metrics.tasks_completed += 1
         self.metrics.total_runtime_sec += duration_sec
+        self.metrics.total_cost_usd += cost_usd
         self.metrics.last_task_at = time.time()
         self.release(task.id)
         if self._health == PoolHealth.DEGRADED and self.metrics.failure_rate < 0.5:
             self._health = PoolHealth.HEALTHY
 
-    def record_failure(self, task: Task, *, duration_sec: float = 0.0) -> None:
+    def record_failure(
+        self, task: Task, *, duration_sec: float = 0.0, cost_usd: float = 0.0
+    ) -> None:
         self.metrics.tasks_failed += 1
+        self.metrics.total_cost_usd += cost_usd
         self.metrics.last_task_at = time.time()
         self._failed_worker_count += 1
         self.release(task.id)
@@ -222,6 +247,7 @@ class WorkerPool:
                 "tasks_failed": self.metrics.tasks_failed,
                 "failure_rate": round(self.metrics.failure_rate, 3),
                 "avg_runtime_sec": round(self.metrics.avg_runtime_sec, 1),
+                "total_cost_usd": round(self.metrics.total_cost_usd, 4),
             },
             capabilities=[c.value for c in self.capabilities],
         )

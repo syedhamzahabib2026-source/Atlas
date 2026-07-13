@@ -63,6 +63,13 @@ class PoolConfig:
     api_key_env_var: str = "ANTHROPIC_API_KEY"
     cooldown_sec: float = 600.0
     description: str = ""
+    # CLI the agent launches in this pool's sessions. Pools own their runtime
+    # (e.g. LocalPool -> an ollama-backed CLI); agents must stay provider-blind.
+    launch_command: str = "claude"
+    # "tmux" or "headless" — how this pool's tasks execute (agents obey).
+    execution_mode: str = "tmux"
+    # Model hint for executors (e.g. an Ollama model tag for LocalPool).
+    model: str = ""
 
     def __post_init__(self) -> None:
         if not self.capabilities:
@@ -148,6 +155,9 @@ def pools_config_from_yaml(data: dict[str, Any] | None) -> WorkerPoolsConfig:
             api_key_env_var=raw.get("api_key_env_var", defaults.api_key_env_var),
             cooldown_sec=float(raw.get("cooldown_sec", defaults.cooldown_sec)),
             description=raw.get("description", defaults.description),
+            launch_command=raw.get("launch_command", defaults.launch_command),
+            execution_mode=raw.get("execution_mode", defaults.execution_mode),
+            model=raw.get("model", defaults.model),
         )
 
     base = WorkerPoolsConfig()

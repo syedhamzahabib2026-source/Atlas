@@ -146,6 +146,10 @@ class WorkerRouter:
         task.metadata["session_prefix"] = pool.session_prefix
         task.metadata["pool_auth_mode"] = pool.auth_mode.value
         task.metadata["pool_cost_tier"] = pool.cost_tier.value
+        task.metadata["pool_launch_command"] = pool.config.launch_command
+        task.metadata["pool_execution_mode"] = pool.config.execution_mode
+        if pool.config.model:
+            task.metadata.setdefault("model", pool.config.model)
         task.metadata["routing_reason"] = decision.reason
         if decision.overflow:
             task.metadata["routing_overflow"] = True

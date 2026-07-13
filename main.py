@@ -8,6 +8,7 @@ Usage:
     python main.py --demo           # quick orchestrator tick (no agents)
     python main.py --run-claude     # one Claude Code task via tmux
     python main.py --run-browser    # one Playwright verification task
+    python main.py --complete-task fec9bffe  # finish blocked task (verify + gates)
 """
 
 from __future__ import annotations
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-browser", action="store_true", help="Run one browser verify task")
     parser.add_argument("--prompt", type=str, default="Say hello in tmux.")
     parser.add_argument(
+        "--complete-task",
+        type=str,
+        metavar="TASK_ID",
+        help="Verify and mark a blocked task complete (no Claude/tmux)",
+    )
+    parser.add_argument(
         "--url",
         type=str,
         default="https://example.com",
@@ -66,6 +73,8 @@ def _claude_agent_config(app_config) -> ClaudeCodeConfig:
         idle_stable_polls=c.idle_stable_polls,
         capture_lines=c.capture_lines,
         kill_session_on_finish=c.kill_session_on_finish,
+        kill_session_on_success=c.kill_session_on_success,
+        execution_mode=c.execution_mode,
     )
 
 
@@ -127,6 +136,7 @@ async def run(
     dashboard: bool = False,
     run_claude: bool = False,
     run_browser: bool = False,
+    complete_task: str | None = None,
     prompt: str = "",
     url: str = "https://example.com",
 ) -> None:
@@ -257,6 +267,20 @@ async def run(
         logger.info("Browser run finished — see logs/screenshots/")
         return
 
+    if complete_task:
+        await orchestrator._bootstrap()
+        assert orchestrator.controller is not None
+        reply = await orchestrator.controller._handle_complete(complete_task)
+        print(reply)
+        await task_manager.flush_all()
+        await orchestrator.stop(graceful=True)
+        await memory.close()
+        if memory_coordinator:
+            await memory_coordinator.close()
+        if task_store:
+            await task_store.close()
+        return
+
     if run_claude:
         if not tmux.is_available():
             logger.error("tmux not available. Install tmux or use WSL on Windows.")
@@ -326,6 +350,7 @@ def main() -> None:
                 dashboard=args.dashboard,
                 run_claude=args.run_claude,
                 run_browser=args.run_browser,
+                complete_task=args.complete_task,
                 prompt=args.prompt,
                 url=args.url,
             )

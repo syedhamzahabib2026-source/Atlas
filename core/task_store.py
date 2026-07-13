@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS persisted_tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON persisted_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON persisted_tasks(project_id, status);
+
+CREATE TABLE IF NOT EXISTS task_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    event TEXT NOT NULL,
+    detail TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id, ts);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON task_events(ts);
 """
 
 
@@ -88,6 +99,10 @@ class TaskStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
+        # WAL keeps readers unblocked during writes; busy_timeout prevents
+        # instant "database is locked" errors under concurrent access.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         logger.info("Task store ready at %s", self.db_path)
@@ -140,6 +155,28 @@ class TaskStore:
 
     async def upsert(self, task: Task) -> None:
         conn = self._conn_req()
+        # Audit trail: detect status transitions at the single persistence
+        # choke point so every writer is covered without touching call sites.
+        new_status = (
+            task.status.value
+            if isinstance(task.status, TaskStatus)
+            else str(task.status)
+        )
+        prev = conn.execute(
+            "SELECT status FROM persisted_tasks WHERE id = ?", (task.id,)
+        ).fetchone()
+        if prev is None or prev["status"] != new_status:
+            conn.execute(
+                "INSERT INTO task_events (task_id, ts, event, detail) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    task.id,
+                    datetime.now(timezone.utc).isoformat(),
+                    "status_change",
+                    f"{prev['status'] if prev else '(new)'} -> {new_status}"
+                    + (f" | {task.error}" if task.error else ""),
+                ),
+            )
         conn.execute(
             """
             INSERT INTO persisted_tasks
@@ -160,6 +197,25 @@ class TaskStore:
             self._task_to_row(task),
         )
         conn.commit()
+
+    async def record_event(self, task_id: str, event: str, detail: str = "") -> None:
+        """Append a non-transition audit event (PR opened, merge, rollback...)."""
+        conn = self._conn_req()
+        conn.execute(
+            "INSERT INTO task_events (task_id, ts, event, detail) VALUES (?, ?, ?, ?)",
+            (task_id, datetime.now(timezone.utc).isoformat(), event, detail[:2000]),
+        )
+        conn.commit()
+
+    async def events_since(self, since_iso: str, limit: int = 500) -> list[dict]:
+        """Audit events after a timestamp — feeds the morning digest."""
+        conn = self._conn_req()
+        cur = conn.execute(
+            "SELECT task_id, ts, event, detail FROM task_events "
+            "WHERE ts >= ? ORDER BY ts LIMIT ?",
+            (since_iso, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
 
     async def get(self, task_id: str) -> Task | None:
         conn = self._conn_req()

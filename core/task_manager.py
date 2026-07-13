@@ -228,14 +228,34 @@ class TaskManager:
     def find_blocked_by_thread(
         self,
         channel_id: str,
-        thread_ts: str,
+        thread_ts: str | None,
     ) -> Task | None:
-        for task in self.list_by_status(TaskStatus.BLOCKED):
-            if (
-                task.metadata.get("slack_channel_id") == channel_id
-                and task.metadata.get("slack_thread_ts") == thread_ts
-            ):
-                return task
+        """
+        Match a Slack reply to a blocked task.
+
+        Accepts explicit thread match OR a single blocked task in the channel
+        (DM users often reply without using Slack's thread UI).
+        """
+        blocked = self.list_by_status(TaskStatus.BLOCKED)
+        channel_matches = [
+            t
+            for t in blocked
+            if t.metadata.get("slack_channel_id") == channel_id
+        ]
+        if not channel_matches:
+            return None
+
+        if thread_ts:
+            for task in channel_matches:
+                anchors = {
+                    task.metadata.get("slack_thread_ts"),
+                    task.metadata.get("blocked_slack_thread_ts"),
+                }
+                if thread_ts in anchors:
+                    return task
+
+        if len(channel_matches) == 1:
+            return channel_matches[0]
         return None
 
     # Matches any run of 8+ hex chars (with optional UUID dashes).

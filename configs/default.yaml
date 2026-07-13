@@ -10,7 +10,7 @@ logging:
 
 sessions:
   session_prefix: atlas
-  tmux_socket: ~                    # null = default socket; set path to share socket
+  tmux_socket: /tmp/atlas-tmux.sock   # shared WSL socket — do not use ~
 
 claude_code:
   command: claude
@@ -19,7 +19,9 @@ claude_code:
   launch_wait_sec: 20               # wait after spawning claude before polling (bumped from 15)
   idle_stable_polls: 3              # consecutive idle reads before marking done
   capture_lines: 200                # pane lines captured per poll
-  kill_session_on_finish: false     # keep session alive for post-mortem inspection
+  kill_session_on_finish: false     # kill session after EVERY run (overrides on_success)
+  kill_session_on_success: true     # kill on success; failed sessions stay for post-mortem
+  execution_mode: tmux              # tmux | headless (claude -p, structured JSON result)
 
 browser:
   headless: true
@@ -70,6 +72,13 @@ runtime:
 
 # Known project repos — used by /atlas start --project <name>
 # repo_path must be an absolute path to a local git repo.
+#
+# Optional per-project fields:
+#   test_command / build_command — quality gates run after Claude finishes;
+#                                  non-zero exit routes the task to recovery
+#   check_timeout_sec            — hard cap per gate command (default 600)
+#   verify_url                   — default browser smoke-verify target
+#   github_owner / github_repo   — PR target repo (token stays in GITHUB_TOKEN)
 projects:
   assignmint:
     repo_path: "/Users/hamza/Desktop/Assignmint3"
@@ -90,11 +99,15 @@ worker_pools:
     max_workers: 2
     priority: 20
     cooldown_sec: 300
+  # Per-pool execution_mode (tmux | headless) and launch_command are
+  # supported on every pool; headless is the path LocalPool will use.
   local:
     pool_id: local
     enabled: false
     session_prefix: atlas-local
     max_workers: 0
+    execution_mode: headless
+    # model: qwen3-coder          # Ollama model tag once LocalPool is enabled
 
 deployment:
   enabled: true

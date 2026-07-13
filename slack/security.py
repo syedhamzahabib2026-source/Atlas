@@ -24,8 +24,16 @@ def is_authorized(
         logger.warning("Denied Slack user: %s", user_id)
         return False, "You are not authorized to control Atlas."
 
-    if config.allowed_channel_ids and channel_id not in config.allowed_channel_ids:
-        logger.warning("Denied Slack channel: %s", channel_id)
-        return False, "This channel is not authorized for Atlas commands."
+    if not config.allowed_channel_ids:
+        return True, ""
 
-    return True, ""
+    if channel_id in config.allowed_channel_ids:
+        return True, ""
+
+    # Direct messages (channel id D…) are not in the workspace channel allow-list
+    # but authorized users should still control Atlas from the app DM.
+    if channel_id and channel_id.startswith("D"):
+        return True, ""
+
+    logger.warning("Denied Slack channel: %s", channel_id)
+    return False, "This channel is not authorized for Atlas commands."
